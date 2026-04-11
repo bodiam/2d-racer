@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>2D Racer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: #1a1a2e;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: Arial, Helvetica, sans-serif;
+        }
+        
+        canvas {
+            border: 3px solid #333;
+            box-shadow: 0 0 30px rgba(0, 0, 0, 0.5);
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    
+    <script>
+        // ============================================
+        // CONSTANTS & CONFIGURATION
+        // ============================================
+        const CANVAS_WIDTH = 800;
+        const CANVAS_HEIGHT = 600;
+        const ROAD_WIDTH = 80;
+        const TRACK_BUFFER = 40;
+        const CAR_WIDTH = 30;
+        const CAR_HEIGHT = 20;
+        
+        const BASE_SPEED = 150;
+        const OFF_ROAD_MULTIPLIER = 0.6;
+        const TURN_RATE = 3.5;
+        const DRIFT_FACTOR = 0.92;
+        const BOUNCE_VELOCITY = 200;
+        
+        const LAPS_PER_ROUND = 3;
+        const ROUNDS_TOTAL = 3;
+        const COUNTDOWN_SECONDS = 3;
+        const ROUND_END_DELAY = 3000;
+        
+        const COLORS = {
+            grass: '#3d5c3d',
+            road: '#2a2a2a',
+            roadEdge: '#1a1a1a',
+            laneMarking: '#ffffff',
+            car1: '#e63946',
+            car2: '#457b9d',
+            uiText: '#ffffff',
+            uiBg: 'rgba(0, 0, 0, 0.7)'
+        };
+        
+        // ============================================
+        // GLOBAL STATE
+        // ============================================
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        let audioCtx = null;
+        let engineOsc1 = null;
+        let engineOsc2 = null;
+        let engineGain1 = null;
+        let engineGain2 = null;
+        
+        let gameState = 'countdown';
+        let countdownValue = 3;
+        let countdownTimer = 0;
+        
+        let currentRound = 1;
+        let p1RoundWins = 0;
+        let p2RoundWins = 0;
+        
+        let track = null;
+        let car1 = null;
+        let car2 = null;
+        
+        let keys = {};
+        
+        let roundEndTimer = 0;
+        let roundWinner = null;
+        
+        // ============================================
+        // AUDIO SYSTEM
+        // ============================================
+        function initAudio() {
+            if (audioCtx) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            
+            engineGain1 = audioCtx.createGain();
+            engineGain1.gain.value = 0;
+            engineGain1.connect(audioCtx.destination);
+            
+            engineGain2 = audioCtx.createGain();
+            engineGain2.gain.value = 0;
+            engineGain2.connect(audioCtx.destination);
+        }
+        
+        function startEngineSound(car) {
+            if (!audioCtx) return;
+            
+            const osc = audioCtx.createOscillator();
+            osc.type = 'sawtooth';
+            osc.frequency.value = 80;
+            osc.connect(car === car1 ? engineGain1 : engineGain2);
+            osc.start();
+            
+            if (car === car1) engineOsc1 = osc;
+            else engineOsc2 = osc;
+        }
+        
+        function updateEngineSound(car, speed) {
+            if (!audioCtx) return;
+            
+            const freq = 80 + (speed / BASE_SPEED) * 120;
+            if (car === car1 && engineOsc1) {
+                engineOsc1.frequency.value = freq;
+            } else if (car === car2 && engineOsc2) {
+                engineOsc2.frequency.value = freq;
+            }
+        }
+        
+        function stopEngineSounds() {
+            if (engineOsc1) {
+                engineOsc1.stop();
+                engineOsc1 = null;
+            }
+            if (engineOsc2) {
+                engineOsc2.stop();
+                engineOsc2 = null;
+            }
+        }
+        
+        function playCollisionSound() {
+            if (!audioCtx) return;
+            
+            const bufferSize = audioCtx.sampleRate * 0.1;
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            
+            for (let i = 0; i < bufferSize; i++) {
+                data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+            }
+            
+            const source = audioCtx.createBufferSource();
+            source.buffer = buffer;
+            
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.value = 200;
+            
+            const gain = audioCtx.createGain();
+            gain.gain.value = 0.3;
+            
+            source.connect(filter);
+            filter.connect(gain);
+            gain.connect(audioCtx.destination);
+            source.start();
+        }
+        
+        function playLapSound() {
+            if (!audioCtx) return;
+            
+            const osc = audioCtx.createOscillator();
+            osc.type = 'sine';
+            osc.frequency.value = 880;
+            
+            const gain = audioCtx.createGain();
+            gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+            
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.1);
+        }
+        
+        function playCountdownBeep(value) {
+            if (!audioCtx) return;
+            
+            const osc = audioCtx.createOscillator();
+            osc.type = 'sine';
+            osc.frequency.value = value === 'GO' ? 880 : 440;
+            
+            const gain = audioCtx.createGain();
+            const duration = value === 'GO' ? 0.3 : 0.15;
+            gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+            
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration);
+        }
+        
+        function playRoundWinFanfare() {
+            if (!audioCtx) return;
+            
+            const notes = [261.63, 329.63, 392.00, 523.25];
+            notes.forEach((freq, i) => {
+                const osc = audioCtx.createOscillator();
+                osc.type = 'sine';
+                osc.frequency.value = freq;
+                
+                const gain = audioCtx.createGain();
+                const startTime = audioCtx.currentTime + i * 0.15;
+                gain.gain.setValueAtTime(0, startTime);
+                gain.gain.linearRampToValueAtTime(0.15, startTime + 0.05);
+                gain.gain.exponentialRampToValueAtTime(0.01, startTime + 0.15);
+                
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start(startTime);
+                osc.stop(startTime + 0.15);
+            });
+        }
+        
+        // ============================================
+        // TRACK GENERATION
+        // ============================================
+        function generateTrack() {
+            const numWaypoints = 8;
+            const centerX = CANVAS_WIDTH / 2;
+            const centerY = CANVAS_HEIGHT / 2;
+            const waypoints = [];
+            
+            for (let i = 0; i < numWaypoints; i++) {
+                const angle = (i / numWaypoints) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
+                const distance = 100 + Math.random() * 150;
+                const x = centerX + Math.cos(angle) * distance;
+                const y = centerY + Math.sin(angle) * distance;
+                
+                const clampedX = Math.max(TRACK_BUFFER, Math.min(CANVAS_WIDTH - TRACK_BUFFER, x));
+                const clampedY = Math.max(TRACK_BUFFER, Math.min(CANVAS_HEIGHT - TRACK_BUFFER, y));
+                
+                waypoints.push({ x: clampedX, y: clampedY, angle });
+            }
+            
+            waypoints.sort((a, b) => a.angle - b.angle);
+            
+            const points = [];
+            const numPoints = 100;
+            
+            for (let i = 0; i < numPoints; i++) {
+                const t = i / numPoints;
+                const point = catmullRom(waypoints, t);
+                points.push(point);
+            }
+            
+            const outerPath = [];
+            const innerPath = [];
+            
+            for (let i = 0; i < points.length; i++) {
+                const curr = points[i];
+                const next = points[(i + 1) % points.length];
+                
+                const dx = next.x - curr.x;
+                const dy = next.y - curr.y;
+                const len = Math.sqrt(dx * dx + dy * dy);
+                const nx = -dy / len;
+                const ny = dx / len;
+                
+                outerPath.push({ x: curr.x + nx * ROAD_WIDTH / 2, y: curr.y + ny * ROAD_WIDTH / 2 });
+                innerPath.push({ x: curr.x - nx * ROAD_WIDTH / 2, y: curr.y - ny * ROAD_WIDTH / 2 });
+            }
+            
+            return {
+                points,
+                outerPath,
+                innerPath,
+                startLine: {
+                    x1: innerPath[0].x,
+                    y1: innerPath[0].y,
+                    x2: outerPath[0].x,
+                    y2: outerPath[0].y
+                }
+            };
+        }
+        
+        function catmullRom(points, t) {
+            const n = points.length;
+            const p = t * n;
+            const i = Math.floor(p);
+            const f = p - i;
+            
+            const p0 = points[(i - 1 + n) % n];
+            const p1 = points[i % n];
+            const p2 = points[(i + 1) % n];
+            const p3 = points[(i + 2) % n];
+            
+            const t2 = f * f;
+            const t3 = t2 * f;
+            
+            return {
+                x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * f + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+                y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * f + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+            };
+        }
+        
+        // ============================================
+        // CAR CLASS
+        // ============================================
+        class Car {
+            constructor(x, y, angle, color, playerNum) {
+                this.x = x;
+                this.y = y;
+                this.angle = angle;
+                this.color = color;
+                this.playerNum = playerNum;
+                this.velocity = { x: 0, y: 0 };
+                this.speed = 0;
+                this.laps = 0;
+                this.lastCheckpoint = -1;
+                this.onGrass = false;
+                this.collisionCooldown = 0;
+                this.lastCheckpointCrossed = false;
+            }
+            
+            update(dt, track) {
+                if (this.collisionCooldown > 0) {
+                    this.collisionCooldown -= dt;
+                }
+                
+                const targetSpeed = this.onGrass ? BASE_SPEED * OFF_ROAD_MULTIPLIER : BASE_SPEED;
+                this.speed = this.speed * 0.95 + targetSpeed * 0.05;
+                
+                let turnAmount = 0;
+                if (this.playerNum === 1) {
+                    if (keys['ArrowLeft']) turnAmount = -1;
+                    if (keys['ArrowRight']) turnAmount = 1;
+                } else {
+                    if (keys['KeyA']) turnAmount = -1;
+                    if (keys['KeyD']) turnAmount = 1;
+                }
+                
+                const speedFactor = this.speed / BASE_SPEED;
+                this.angle += turnAmount * TURN_RATE * speedFactor * dt;
+                
+                const targetVelX = Math.cos(this.angle) * this.speed;
+                const targetVelY = Math.sin(this.angle) * this.speed;
+                
+                this.velocity.x = this.velocity.x * DRIFT_FACTOR + targetVelX * (1 - DRIFT_FACTOR);
+                this.velocity.y = this.velocity.y * DRIFT_FACTOR + targetVelY * (1 - DRIFT_FACTOR);
+                
+                this.x += this.velocity.x * dt;
+                this.y += this.velocity.y * dt;
+                
+                this.x = Math.max(20, Math.min(CANVAS_WIDTH - 20, this.x));
+                this.y = Math.max(20, Math.min(CANVAS_HEIGHT - 20, this.y));
+                
+                this.onGrass = !this.isOnTrack(track);
+                
+                this.checkLap(track);
+            }
+            
+            isOnTrack(track) {
+                for (let i = 0; i < track.points.length; i++) {
+                    const p = track.points[i];
+                    const dx = this.x - p.x;
+                    const dy = this.y - p.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < ROAD_WIDTH / 2 + 5) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            
+            checkLap(track) {
+                const startLine = track.startLine;
+                const dx = startLine.x2 - startLine.x1;
+                const dy = startLine.y2 - startLine.y1;
+                const lineLen = Math.sqrt(dx * dx + dy * dy);
+                const nx = dx / lineLen;
+                const ny = dy / lineLen;
+                
+                const cx = (startLine.x1 + startLine.x2) / 2;
+                const cy = (startLine.y1 + startLine.y2) / 2;
+                
+                const toCarX = this.x - cx;
+                const toCarY = this.y - cy;
+                
+                const dot = toCarX * nx + toCarY * ny;
+                const inStartZone = Math.abs(dot) < ROAD_WIDTH / 2;
+                
+                if (inStartZone) {
+                    const carDirX = Math.cos(this.angle);
+                    const carDirY = Math.sin(this.angle);
+                    const dirDot = carDirX * nx + carDirY * ny;
+                    
+                    if (dirDot > 0.5 && !this.lastCheckpointCrossed) {
+                        this.laps++;
+                        this.lastCheckpointCrossed = true;
+                        playLapSound();
+                    }
+                } else {
+                    this.lastCheckpointCrossed = false;
+                }
+            }
+            
+            applyBounce(nx, ny) {
+                const dot = this.velocity.x * nx + this.velocity.y * ny;
+                this.velocity.x -= 2 * dot * nx;
+                this.velocity.y -= 2 * dot * ny;
+                
+                this.velocity.x += nx * BOUNCE_VELOCITY * 0.5;
+                this.velocity.y += ny * BOUNCE_VELOCITY * 0.5;
+            }
+            
+            draw(ctx) {
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.rotate(this.angle);
+                
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+                ctx.beginPath();
+                ctx.roundRect(-CAR_WIDTH / 2 + 2, -CAR_HEIGHT / 2 + 2, CAR_WIDTH, CAR_HEIGHT, 4);
+                ctx.fill();
+                
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.roundRect(-CAR_WIDTH / 2, -CAR_HEIGHT / 2, CAR_WIDTH, CAR_HEIGHT, 4);
+                ctx.fill();
+                
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+                ctx.fillRect(-CAR_WIDTH / 2 + 4, -CAR_HEIGHT / 2 + 2, CAR_WIDTH - 16, 4);
+                
+                ctx.fillStyle = '#222';
+                ctx.fillRect(CAR_WIDTH / 2 - 4, -CAR_HEIGHT / 2 + 2, 3, CAR_HEIGHT - 4);
+                
+                ctx.restore();
+            }
+        }
+        
+        // ============================================
+        // COLLISION DETECTION
+        // ============================================
+        function checkCarCollision(c1, c2) {
+            const dx = c2.x - c1.x;
+            const dy = c2.y - c1.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const minDist = (CAR_WIDTH + CAR_HEIGHT) / 2;
+            
+            if (dist < minDist && dist > 0) {
+                const nx = dx / dist;
+                const ny = dy / dist;
+                
+                const overlap = minDist - dist;
+                c1.x -= nx * overlap / 2;
+                c1.y -= ny * overlap / 2;
+                c2.x += nx * overlap / 2;
+                c2.y += ny * overlap / 2;
+                
+                if (c1.collisionCooldown <= 0) {
+                    c1.applyBounce(nx, ny);
+                    c2.applyBounce(-nx, -ny);
+                    c1.collisionCooldown = 0.1;
+                    c2.collisionCooldown = 0.1;
+                    playCollisionSound();
+                }
+            }
+        }
+        
+        // ============================================
+        // GAME INITIALIZATION
+        // ============================================
+        function initGame() {
+            initAudio();
+            startNewRound();
+            gameState = 'countdown';
+            countdownValue = 3;
+            countdownTimer = 0;
+        }
+        
+        function startNewRound() {
+            track = generateTrack();
+            
+            const startX = (track.points[0].x + track.points[10].x) / 2;
+            const startY = (track.points[0].y + track.points[10].y) / 2;
+            const startAngle = Math.atan2(
+                track.points[10].y - track.points[0].y,
+                track.points[10].x - track.points[0].x
+            );
+            
+            car1 = new Car(startX - 30, startY - 15, startAngle + Math.PI / 2, COLORS.car1, 1);
+            car2 = new Car(startX + 30, startY - 15, startAngle + Math.PI / 2, COLORS.car2, 2);
+            
+            car1.laps = 0;
+            car2.laps = 0;
+            car1.speed = 0;
+            car2.speed = 0;
+            
+            startEngineSound(car1);
+            startEngineSound(car2);
+        }
+        
+        // ============================================
+        // GAME LOOP
+        // ============================================
+        let lastTime = 0;
+        
+        function update(dt) {
+            if (gameState === 'countdown') {
+                countdownTimer += dt * 1000;
+                const newCountdown = 3 - Math.floor(countdownTimer / 1000);
+                
+                if (newCountdown !== countdownValue && newCountdown >= 0) {
+                    countdownValue = newCountdown;
+                    if (countdownValue > 0) {
+                        playCountdownBeep(countdownValue);
+                    } else {
+                        playCountdownBeep('GO');
+                    }
+                }
+                
+                if (countdownTimer >= 3000) {
+                    gameState = 'racing';
+                    countdownValue = 0;
+                }
+            } else if (gameState === 'racing') {
+                car1.update(dt, track);
+                car2.update(dt, track);
+                
+                updateEngineSound(car1, car1.speed);
+                updateEngineSound(car2, car2.speed);
+                
+                checkCarCollision(car1, car2);
+                
+                if (car1.laps >= LAPS_PER_ROUND) {
+                    endRound(1);
+                } else if (car2.laps >= LAPS_PER_ROUND) {
+                    endRound(2);
+                }
+            } else if (gameState === 'roundEnd') {
+                roundEndTimer -= dt * 1000;
+                if (roundEndTimer <= 0) {
+                    if (currentRound >= ROUNDS_TOTAL) {
+                        gameState = 'raceEnd';
+                    } else {
+                        currentRound++;
+                        startNewRound();
+                        gameState = 'countdown';
+                        countdownValue = 3;
+                        countdownTimer = 0;
+                    }
+                }
+            }
+        }
+        
+        function endRound(winner) {
+            gameState = 'roundEnd';
+            roundEndTimer = ROUND_END_DELAY;
+            roundWinner = winner;
+            
+            if (winner === 1) {
+                p1RoundWins++;
+            } else {
+                p2RoundWins++;
+            }
+            
+            playRoundWinFanfare();
+            
+            engineGain1.gain.value = 0;
+            engineGain2.gain.value = 0;
+        }
+        
+        function draw() {
+            ctx.fillStyle = COLORS.grass;
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            if (track) {
+                drawTrack();
+            }
+            
+            if (car1 && car2) {
+                car1.draw(ctx);
+                car2.draw(ctx);
+            }
+            
+            drawHUD();
+            
+            if (gameState === 'countdown') {
+                drawCountdown();
+            } else if (gameState === 'roundEnd') {
+                drawRoundEnd();
+            } else if (gameState === 'raceEnd') {
+                drawRaceEnd();
+            }
+        }
+        
+        function drawTrack() {
+            ctx.fillStyle = COLORS.road;
+            ctx.beginPath();
+            ctx.moveTo(track.outerPath[0].x, track.outerPath[0].y);
+            for (let i = 1; i < track.outerPath.length; i++) {
+                ctx.lineTo(track.outerPath[i].x, track.outerPath[i].y);
+            }
+            ctx.closePath();
+            ctx.fill();
+            
+            ctx.fillStyle = COLORS.grass;
+            ctx.beginPath();
+            ctx.moveTo(track.innerPath[0].x, track.innerPath[0].y);
+            for (let i = 1; i < track.innerPath.length; i++) {
+                ctx.lineTo(track.innerPath[i].x, track.innerPath[i].y);
+            }
+            ctx.closePath();
+            ctx.fill();
+            
+            ctx.strokeStyle = COLORS.laneMarking;
+            ctx.lineWidth = 2;
+            ctx.setLineDash([15, 15]);
+            ctx.beginPath();
+            const innerCenter = [];
+            for (let i = 0; i < track.points.length; i++) {
+                const outer = track.outerPath[i];
+                const inner = track.innerPath[i];
+                innerCenter.push({
+                    x: (outer.x + inner.x) / 2,
+                    y: (outer.y + inner.y) / 2
+                });
+            }
+            ctx.moveTo(innerCenter[0].x, innerCenter[0].y);
+            for (let i = 1; i < innerCenter.length; i++) {
+                ctx.lineTo(innerCenter[i].x, innerCenter[i].y);
+            }
+            ctx.closePath();
+            ctx.stroke();
+            ctx.setLineDash([]);
+            
+            drawStartFinishLine();
+        }
+        
+        function drawStartFinishLine() {
+            const sl = track.startLine;
+            const dx = sl.x2 - sl.x1;
+            const dy = sl.y2 - sl.y1;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            const nx = -dy / len;
+            const ny = dx / len;
+            
+            const checkSize = 8;
+            const numChecks = Math.ceil(len / checkSize);
+            
+            for (let i = 0; i < numChecks; i++) {
+                const t = i / numChecks;
+                const cx = sl.x1 + dx * t;
+                const cy = sl.y1 + dy * t;
+                
+                for (let j = 0; j < 2; j++) {
+                    ctx.fillStyle = (i + j) % 2 === 0 ? '#fff' : '#000';
+                    ctx.beginPath();
+                    ctx.rect(
+                        cx + nx * (j * checkSize - checkSize / 2),
+                        cy + ny * (j * checkSize - checkSize / 2),
+                        checkSize,
+                        checkSize
+                    );
+                    ctx.fill();
+                }
+            }
+        }
+        
+        function drawHUD() {
+            ctx.fillStyle = COLORS.uiBg;
+            ctx.fillRect(0, 0, CANVAS_WIDTH, 40);
+            
+            ctx.font = 'bold 18px Arial';
+            ctx.textAlign = 'left';
+            
+            ctx.fillStyle = COLORS.car1;
+            ctx.fillText(`P1: ${car1 ? car1.laps : 0}/${LAPS_PER_ROUND}`, 20, 27);
+            
+            ctx.fillStyle = COLORS.uiText;
+            ctx.fillText(`Round ${currentRound}/${ROUNDS_TOTAL}`, CANVAS_WIDTH / 2 - 50, 27);
+            
+            ctx.textAlign = 'right';
+            ctx.fillStyle = COLORS.car2;
+            ctx.fillText(`P2: ${car2 ? car2.laps : 0}/${LAPS_PER_ROUND}`, CANVAS_WIDTH - 20, 27);
+            
+            ctx.fillStyle = COLORS.uiBg;
+            ctx.fillRect(0, CANVAS_HEIGHT - 30, CANVAS_WIDTH, 30);
+            
+            ctx.font = '14px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = COLORS.uiText;
+            
+            const p1Dots = '●'.repeat(p1RoundWins) + '○'.repeat(ROUNDS_TOTAL - p1RoundWins);
+            const p2Dots = '●'.repeat(p2RoundWins) + '○'.repeat(ROUNDS_TOTAL - p2RoundWins);
+            
+            ctx.fillText(`P1 wins: ${p1Dots}`, 120, CANVAS_HEIGHT - 12);
+            ctx.fillText(`P2 wins: ${p2Dots}`, CANVAS_WIDTH - 120, CANVAS_HEIGHT - 12);
+            
+            ctx.fillStyle = '#aaa';
+            ctx.font = '12px Arial';
+            ctx.fillText('← → = P1  |  A D = P2', CANVAS_WIDTH / 2, CANVAS_HEIGHT - 12);
+        }
+        
+        function drawCountdown() {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            ctx.font = 'bold 72px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 4;
+            
+            const text = countdownValue > 0 ? countdownValue.toString() : 'GO!';
+            
+            ctx.strokeText(text, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+            ctx.fillStyle = '#fff';
+            ctx.fillText(text, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+            
+            ctx.textBaseline = 'alphabetic';
+        }
+        
+        function drawRoundEnd() {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            ctx.font = 'bold 48px Arial';
+            ctx.textAlign = 'center';
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 4;
+            
+            const winnerColor = roundWinner === 1 ? COLORS.car1 : COLORS.car2;
+            const text = `Player ${roundWinner} Wins!`;
+            
+            ctx.strokeText(text, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+            ctx.fillStyle = winnerColor;
+            ctx.fillText(text, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+        }
+        
+        function drawRaceEnd() {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            ctx.font = 'bold 48px Arial';
+            ctx.textAlign = 'center';
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 4;
+            
+            let winner, winnerColor;
+            if (p1RoundWins > p2RoundWins) {
+                winner = 'Player 1';
+                winnerColor = COLORS.car1;
+            } else if (p2RoundWins > p1RoundWins) {
+                winner = 'Player 2';
+                winnerColor = COLORS.car2;
+            } else {
+                winner = 'It\'s a Tie!';
+                winnerColor = '#fff';
+            }
+            
+            const title = winner === 'It\'s a Tie!' ? 'Tie Game!' : `${winner} Wins the Race!`;
+            
+            ctx.strokeText(title, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 40);
+            ctx.fillStyle = winnerColor;
+            ctx.fillText(title, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 40);
+            
+            ctx.font = 'bold 28px Arial';
+            ctx.fillStyle = '#fff';
+            ctx.fillText(`P1: ${p1RoundWins} rounds | P2: ${p2RoundWins} rounds`, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 20);
+            
+            ctx.font = '18px Arial';
+            ctx.fillStyle = '#aaa';
+            ctx.fillText('Press SPACE to play again', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 60);
+        }
+        
+        function gameLoop(timestamp) {
+            const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+            lastTime = timestamp;
+            
+            update(dt);
+            draw();
+            
+            requestAnimationFrame(gameLoop);
+        }
+        
+        // ============================================
+        // INPUT HANDLING
+        // ============================================
+        document.addEventListener('keydown', (e) => {
+            keys[e.code] = true;
+            
+            if (e.code === 'Space' && gameState === 'raceEnd') {
+                p1RoundWins = 0;
+                p2RoundWins = 0;
+                currentRound = 1;
+                initGame();
+            }
+        });
+        
+        document.addEventListener('keyup', (e) => {
+            keys[e.code] = false;
+        });
+        
+        // ============================================
+        // START GAME
+        // ============================================
+        initGame();
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>

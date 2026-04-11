@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>2P Hotseat Racer</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #111;
+    height: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-family: sans-serif;
+    color: #fff;
+    overflow: hidden;
+  }
+  canvas {
+    border: 2px solid #333;
+    background: #2a5d2a;
+    box-shadow: 0 0 30px rgba(0,0,0,0.7);
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+// ============================================================
+// 2D Top-down 2-Player Hotseat Racing Game
+// Single file, vanilla JS, no libraries.
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+
+// ---------- Tunables ----------
+const ROAD_HALF_WIDTH = 42;
+const CAR_MAX_SPEED = 200;
+const CAR_OFFROAD_SPEED = 60;
+const CAR_ACCEL = 2.2;
+const CAR_RADIUS = 10;
+const TURN_RATE_MAX = 3.2;      // rad/s at full speed
+const DRIFT_RESPONSE = 4.5;     // velocity catch-up to heading
+const LAPS_PER_ROUND = 3;
+const ROUNDS_PER_RACE = 3;
+
+// ============================================================
+// Audio  (all sounds synthesized via Web Audio API)
+// ============================================================
+let audioCtx = null;
+
+function ensureAudio() {
+  if (!audioCtx) {
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) { return; }
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function createEngine(baseFreq) {
+  if (!audioCtx) return null;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sawtooth';
+  osc.frequency.value = baseFreq;
+  gain.gain.value = 0;
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  return { osc, gain, baseFreq };
+}
+
+function updateEngine(engine, speed, active) {
+  if (!engine) return;
+  const rate = Math.max(0, speed) / CAR_MAX_SPEED;
+  engine.osc.frequency.value = engine.baseFreq + rate * 140;
+  engine.gain.gain.value = active ? (0.015 + rate * 0.035) : 0;
+}
+
+function playNoise(duration = 0.2, vol = 0.3) {
+  if (!audioCtx) return;
+  const buf = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * duration), audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) {
+    data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+  }
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 1100;
+  const gain = audioCtx.createGain();
+  gain.gain.value = vol;
+  src.connect(filter);
+  filter.connect(gain);
+  gain.connect(audioCtx.destination);
+  src.start();
+}
+
+function playBeep(freq, duration = 0.15, type = 'square', vol = 0.15) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start(t);
+  osc.stop(t + duration);
+}
+
+function playFanfare() {
+  const notes = [523.25, 659.25, 783.99, 1046.5];
+  notes.forEach((f, i) => setTimeout(() => playBeep(f, 0.22, 'square', 0.18), i * 130));
+}
+
+// ============================================================
+// Track generation
+// ============================================================
+let track = null;
+
+function catmullRom(p0, p1, p2, p3, t) {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return 0.5 * (
+    (2 * p1) +
+    (-p0 + p2) * t +
+    (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+    (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+  );
+}
+
+function generateTrack() {
+  const cx = W / 2;
+  const cy = H / 2;
+  const num = 7 + Math.floor(Math.random() * 4); // 7 - 10
+  const waypoints = [];
+
+  for (let i = 0; i < num; i++) {
+    // Evenly spaced around the center with small random jitter
+    const baseAngle = (i / num) * Math.PI * 2;
+    const angle = baseAngle + (Math.random() - 0.5) * 0.25;
+    const r = 190 + Math.random() * 55;
+    waypoints.push({
+      x: cx + Math.cos(angle) * r * 1.25,
+      y: cy + Math.sin(angle) * r * 0.85,
+      angle: angle
+    });
+  }
+  waypoints.sort((a, b) => a.angle - b.angle);
+
+  // Build a smooth centerline using Catmull-Rom spline
+  const centerline = [];
+  const steps = 28;
+  for (let i = 0; i < waypoints.length; i++) {
+    const p0 = waypoints[(i - 1 + waypoints.length) % waypoints.length];
+    const p1 = waypoints[i];
+    const p2 = waypoints[(i + 1) % waypoints.length];
+    const p3 = waypoints[(i + 2) % waypoints.length];
+    for (let s = 0; s < steps; s++) {
+      const t = s / steps;
+      centerline.push({
+        x: catmullRom(p0.x, p1.x, p2.x, p3.x, t),
+        y: catmullRom(p0.y, p1.y, p2.y, p3.y, t)
+      });
+    }
+  }
+
+  // Clamp points inside canvas (accounting for road + margin)
+  const margin = ROAD_HALF_WIDTH + 8;
+  for (const p of centerline) {
+    p.x = Math.max(margin, Math.min(W - margin, p.x));
+    p.y = Math.max(margin, Math.min(H - margin, p.y));
+  }
+
+  // Precompute unit tangents along the centerline
+  for (let i = 0; i < centerline.length; i++) {
+    const a = centerline[(i - 1 + centerline.length) % centerline.length];
+    const b = centerline[(i + 1) % centerline.length];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    centerline[i].tx = dx / len;
+    centerline[i].ty = dy / len;
+  }
+
+  return { centerline };
+}
+
+function findClosest(x, y) {
+  const pts = track.centerline;
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const dx = pts[i].x - x;
+    const dy = pts[i].y - y;
+    const d = dx * dx + dy * dy;
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  }
+  return { idx: bestIdx, dist: Math.sqrt(bestDist) };
+}
+
+// ============================================================
+// Car
+// ============================================================
+class Car {
+  constructor(color, colorBright) {
+    this.color = color;
+    this.colorBright = colorBright;
+    this.x = 0;
+    this.y = 0;
+    this.angle = 0;
+    this.speed = 0;
+    this.vx = 0;
+    this.vy = 0;
+    this.steer = 0;
+    this.laps = 0;
+    this.prevIdx = 0;
+    this.maxIdx = 0;
+    this.engine = null;
+  }
+
+  reset(x, y, angle) {
+    this.x = x;
+    this.y = y;
+    this.angle = angle;
+    this.speed = 0;
+    this.vx = 0;
+    this.vy = 0;
+    this.steer = 0;
+    this.laps = 0;
+    this.prevIdx = 0;
+    this.maxIdx = 0;
+  }
+
+  update(dt, canMove) {
+    const close = findClosest(this.x, this.y);
+    const offRoad = close.dist > ROAD_HALF_WIDTH - CAR_RADIUS;
+
+    // Auto-accelerate toward target speed
+    const target = canMove ? (offRoad ? CAR_OFFROAD_SPEED : CAR_MAX_SPEED) : 0;
+    this.speed += (target - this.speed) * dt * CAR_ACCEL;
+
+    // Steering is stronger at higher speed (feels arcadey)
+    const steerStrength = TURN_RATE_MAX * Math.min(1, this.speed / 140);
+    this.angle += this.steer * steerStrength * dt;
+
+    // Drift: velocity vector catches up to the heading over time
+    const fx = Math.cos(this.angle) * this.speed;
+    const fy = Math.sin(this.angle) * this.speed;
+    const k = 1 - Math.exp(-dt * DRIFT_RESPONSE);
+    this.vx += (fx - this.vx) * k;
+    this.vy += (fy - this.vy) * k;
+
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+
+    // If on grass, softly nudge back toward the centerline
+    if (offRoad) {
+      const tp = track.centerline[close.idx];
+      const dx = tp.x - this.x;
+      const dy = tp.y - this.y;
+      const d = Math.hypot(dx, dy) || 1;
+      this.x += (dx / d) * 60 * dt;
+      this.y += (dy / d) * 60 * dt;
+    }
+
+    // Hard clamp to canvas
+    this.x = Math.max(CAR_RADIUS, Math.min(W - CAR_RADIUS, this.x));
+    this.y = Math.max(CAR_RADIUS, Math.min(H - CAR_RADIUS, this.y));
+
+    // Lap counting via centerline progress
+    const L = track.centerline.length;
+    if (canMove) {
+      if (
+        close.idx < L * 0.15 &&
+        this.prevIdx > L * 0.85 &&
+        this.maxIdx > L * 0.55
+      ) {
+        this.laps++;
+        this.maxIdx = 0;
+        playBeep(880, 0.18, 'triangle', 0.2);
+      } else if (close.idx > this.maxIdx && close.idx < L * 0.97) {
+        this.maxIdx = close.idx;
+      }
+      this.prevIdx = close.idx;
+    }
+
+    updateEngine(this.engine, this.speed, canMove);
+  }
+
+  draw(ctx) {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.angle);
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(-11, -7, 24, 16);
+    // Body
+    ctx.fillStyle = this.color;
+    ctx.fillRect(-13, -9, 26, 18);
+    // Highlight stripe
+    ctx.fillStyle = this.colorBright;
+    ctx.fillRect(-13, -9, 26, 3);
+    ctx.fillRect(-13, 6, 26, 3);
+    // Windshield
+    ctx.fillStyle = '#aaccee';
+    ctx.fillRect(-2, -6, 7, 12);
+    // Nose cap
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(11, -5, 2, 10);
+    ctx.restore();
+  }
+}
+
+// ============================================================
+// Game state
+// ============================================================
+const p1 = new Car('#e02323', '#ff7777');
+const p2 = new Car('#2b6cff', '#77aaff');
+
+let state = 'countdown';  // 'countdown' | 'racing' | 'roundOver' | 'gameOver'
+let stateTimer = 0;
+let round = 1;
+let p1Wins = 0;
+let p2Wins = 0;
+let roundWinner = null;
+let countdownStep = -1;
+
+function placeCarsAtStart() {
+  const s0 = track.centerline[0];
+  const s1 = track.centerline[4 % track.centerline.length];
+  const angle = Math.atan2(s1.y - s0.y, s1.x - s0.x);
+  const perpX = -Math.sin(angle);
+  const perpY = Math.cos(angle);
+  // Back the cars off the line a bit so they cross it on the first lap
+  const backX = -Math.cos(angle) * 18;
+  const backY = -Math.sin(angle) * 18;
+  p1.reset(s0.x + perpX * 13 + backX, s0.y + perpY * 13 + backY, angle);
+  p2.reset(s0.x - perpX * 13 + backX, s0.y - perpY * 13 + backY, angle);
+}
+
+function startRound() {
+  track = generateTrack();
+  placeCarsAtStart();
+  state = 'countdown';
+  stateTimer = 0;
+  countdownStep = -1;
+}
+
+function newGame() {
+  p1Wins = 0;
+  p2Wins = 0;
+  round = 1;
+  startRound();
+}
+
+// ============================================================
+// Input
+// ============================================================
+const keys = {};
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  ensureAudio();
+  initEngines();
+  if (state === 'gameOver' && k === ' ') {
+    newGame();
+  }
+  if (['arrowleft', 'arrowright', 'arrowup', 'arrowdown', ' ', 'a', 'd'].includes(k)) {
+    e.preventDefault();
+  }
+});
+window.addEventListener('keyup', e => {
+  keys[e.key.toLowerCase()] = false;
+});
+window.addEventListener('click', () => { ensureAudio(); initEngines(); });
+
+function readInputs() {
+  p1.steer = (keys['arrowright'] ? 1 : 0) - (keys['arrowleft'] ? 1 : 0);
+  p2.steer = (keys['d'] ? 1 : 0) - (keys['a'] ? 1 : 0);
+}
+
+// ============================================================
+// Car-car collision (simple circle push + impulse)
+// ============================================================
+function resolveCarCollision() {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const d = Math.hypot(dx, dy);
+  const minD = CAR_RADIUS * 2;
+  if (d > 0 && d < minD) {
+    const nx = dx / d;
+    const ny = dy / d;
+    const overlap = minD - d;
+    p1.x -= nx * overlap * 0.5;
+    p1.y -= ny * overlap * 0.5;
+    p2.x += nx * overlap * 0.5;
+    p2.y += ny * overlap * 0.5;
+
+    const rvx = p2.vx - p1.vx;
+    const rvy = p2.vy - p1.vy;
+    const impact = rvx * nx + rvy * ny;
+    if (impact < 0) {
+      const push = impact * 1.1;
+      p1.vx += nx * push;
+      p1.vy += ny * push;
+      p2.vx -= nx * push;
+      p2.vy -= ny * push;
+      // Bonus sideways kick for arcade feel
+      p1.speed *= 0.85;
+      p2.speed *= 0.85;
+      playNoise(0.18, 0.3);
+    }
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function drawTrack() {
+  // Grass base
+  ctx.fillStyle = '#2d6430';
+  ctx.fillRect(0, 0, W, H);
+  // Grass speckles
+  ctx.fillStyle = '#1f4a22';
+  for (let i = 0; i < 120; i++) {
+    const x = (i * 97 + 17) % W;
+    const y = (i * 131 + 41) % H;
+    ctx.fillRect(x, y, 3, 3);
+  }
+  ctx.fillStyle = '#3a7a40';
+  for (let i = 0; i < 60; i++) {
+    const x = (i * 53 + 9) % W;
+    const y = (i * 71 + 23) % H;
+    ctx.fillRect(x, y, 2, 2);
+  }
+
+  const pts = track.centerline;
+
+  // Road border (dirt shoulder)
+  ctx.strokeStyle = '#6b4a22';
+  ctx.lineWidth = ROAD_HALF_WIDTH * 2 + 10;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  tracePath(pts);
+  ctx.stroke();
+
+  // Asphalt
+  ctx.strokeStyle = '#383838';
+  ctx.lineWidth = ROAD_HALF_WIDTH * 2;
+  tracePath(pts);
+  ctx.stroke();
+
+  // Asphalt highlight
+  ctx.strokeStyle = '#4a4a4a';
+  ctx.lineWidth = ROAD_HALF_WIDTH * 2 - 6;
+  tracePath(pts);
+  ctx.stroke();
+
+  // Centerline dashed stripe
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([12, 16]);
+  tracePath(pts);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Start / finish checkered line
+  drawStartLine();
+}
+
+function tracePath(pts) {
+  ctx.beginPath();
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    if (i === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  }
+  ctx.closePath();
+}
+
+function drawStartLine() {
+  const sp = track.centerline[0];
+  const rot = Math.atan2(sp.ty, sp.tx);
+  const squares = 8;
+  const sq = (ROAD_HALF_WIDTH * 2) / squares; // square size
+  ctx.save();
+  ctx.translate(sp.x, sp.y);
+  ctx.rotate(rot);
+  for (let row = 0; row < 2; row++) {
+    for (let col = 0; col < squares; col++) {
+      ctx.fillStyle = (row + col) % 2 === 0 ? '#ffffff' : '#111111';
+      ctx.fillRect(-sq + row * sq, -ROAD_HALF_WIDTH + col * sq, sq, sq);
+    }
+  }
+  ctx.restore();
+}
+
+function drawText(str, x, y, size, align, color) {
+  ctx.font = 'bold ' + size + 'px sans-serif';
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = Math.max(3, size / 8);
+  ctx.strokeStyle = '#000';
+  ctx.strokeText(str, x, y);
+  ctx.fillStyle = color || '#fff';
+  ctx.fillText(str, x, y);
+}
+
+function drawHUD() {
+  // Top bar
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, W, 44);
+
+  drawText('P1 LAPS ' + Math.min(p1.laps, LAPS_PER_ROUND) + '/' + LAPS_PER_ROUND, 90, 22, 16, 'center', '#ff6666');
+  drawText('P2 LAPS ' + Math.min(p2.laps, LAPS_PER_ROUND) + '/' + LAPS_PER_ROUND, W - 90, 22, 16, 'center', '#66aaff');
+  drawText('Round ' + round + '/' + ROUNDS_PER_RACE, W / 2, 22, 18, 'center', '#ffffff');
+
+  // Round win dots
+  for (let i = 0; i < ROUNDS_PER_RACE; i++) {
+    const cx = 200 + i * 18;
+    ctx.beginPath();
+    ctx.arc(cx, 22, 6, 0, Math.PI * 2);
+    ctx.fillStyle = i < p1Wins ? '#ff6666' : '#3a1616';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = '#fff';
+    ctx.stroke();
+  }
+  for (let i = 0; i < ROUNDS_PER_RACE; i++) {
+    const cx = W - 200 - i * 18;
+    ctx.beginPath();
+    ctx.arc(cx, 22, 6, 0, Math.PI * 2);
+    ctx.fillStyle = i < p2Wins ? '#66aaff' : '#142238';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = '#fff';
+    ctx.stroke();
+  }
+
+  // Bottom controls hint
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(0, H - 28, W, 28);
+  drawText('P1: \u2190  \u2192', 90, H - 14, 13, 'center', '#ffaaaa');
+  drawText('P2: A  D', W - 90, H - 14, 13, 'center', '#aaccff');
+  drawText('First to ' + LAPS_PER_ROUND + ' laps wins the round', W / 2, H - 14, 13, 'center', '#dddddd');
+}
+
+function drawOverlay() {
+  if (state === 'countdown') {
+    let label;
+    let color = '#ffffff';
+    if (countdownStep <= 0) label = '3';
+    else if (countdownStep === 1) label = '2';
+    else if (countdownStep === 2) label = '1';
+    else { label = 'GO!'; color = '#ffe24b'; }
+    drawText(label, W / 2, H / 2, 130, 'center', color);
+  } else if (state === 'roundOver') {
+    const color = roundWinner === 1 ? '#ff6666' : '#66aaff';
+    drawText('Player ' + roundWinner + ' wins round ' + round + '!', W / 2, H / 2, 36, 'center', color);
+  } else if (state === 'gameOver') {
+    let msg, color;
+    if (p1Wins > p2Wins) { msg = 'Player 1 wins the race!'; color = '#ff6666'; }
+    else if (p2Wins > p1Wins) { msg = 'Player 2 wins the race!'; color = '#66aaff'; }
+    else { msg = 'It\u2019s a tie!'; color = '#ffffff'; }
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, H / 2 - 90, W, 180);
+    drawText(msg, W / 2, H / 2 - 40, 42, 'center', color);
+    drawText('Final score   ' + p1Wins + '  -  ' + p2Wins, W / 2, H / 2 + 8, 24, 'center', '#ffffff');
+    drawText('Press SPACE to race again', W / 2, H / 2 + 52, 18, 'center', '#cccccc');
+  }
+}
+
+// ============================================================
+// Game loop
+// ============================================================
+let lastTime = 0;
+
+function tick(time) {
+  const dt = Math.min(0.05, (time - lastTime) / 1000 || 0);
+  lastTime = time;
+
+  readInputs();
+
+  if (state === 'countdown') {
+    stateTimer += dt;
+    const step = Math.floor(stateTimer);
+    if (step !== countdownStep && step <= 3) {
+      countdownStep = step;
+      if (step < 3) playBeep(440, 0.2, 'square', 0.2);
+      else playBeep(880, 0.3, 'square', 0.22);
+    }
+    // Cars sit still (engines idle)
+    p1.update(dt, false);
+    p2.update(dt, false);
+    if (stateTimer >= 3.8) {
+      state = 'racing';
+      stateTimer = 0;
+    }
+  } else if (state === 'racing') {
+    p1.update(dt, true);
+    p2.update(dt, true);
+    resolveCarCollision();
+    if (p1.laps >= LAPS_PER_ROUND || p2.laps >= LAPS_PER_ROUND) {
+      roundWinner = p1.laps >= LAPS_PER_ROUND ? 1 : 2;
+      if (roundWinner === 1) p1Wins++; else p2Wins++;
+      state = 'roundOver';
+      stateTimer = 0;
+      playFanfare();
+    }
+  } else if (state === 'roundOver') {
+    stateTimer += dt;
+    p1.update(dt, false);
+    p2.update(dt, false);
+    if (stateTimer >= 2.8) {
+      if (round >= ROUNDS_PER_RACE) {
+        state = 'gameOver';
+        updateEngine(p1.engine, 0, false);
+        updateEngine(p2.engine, 0, false);
+      } else {
+        round++;
+        startRound();
+      }
+    }
+  } else if (state === 'gameOver') {
+    updateEngine(p1.engine, 0, false);
+    updateEngine(p2.engine, 0, false);
+  }
+
+  // ---- render ----
+  drawTrack();
+  p1.draw(ctx);
+  p2.draw(ctx);
+  drawHUD();
+  drawOverlay();
+
+  requestAnimationFrame(tick);
+}
+
+// ============================================================
+// Boot
+// ============================================================
+let enginesInited = false;
+function initEngines() {
+  if (enginesInited) return;
+  ensureAudio();
+  if (!audioCtx) return;
+  p1.engine = createEngine(70);
+  p2.engine = createEngine(82);
+  enginesInited = true;
+}
+
+newGame();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

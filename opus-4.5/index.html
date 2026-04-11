@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Turbo Drift - 2 Player Racing</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #1a1a2e;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #gameContainer {
+            position: relative;
+            box-shadow: 0 0 60px rgba(0, 200, 255, 0.3);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <canvas id="gameCanvas" width="800" height="600"></canvas>
+    </div>
+
+    <script>
+// ============================================================
+// TURBO DRIFT - 2 Player Top-Down Racing Game
+// ============================================================
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const WIDTH = 800;
+const HEIGHT = 600;
+
+// ============================================================
+// GAME STATE
+// ============================================================
+
+const gameState = {
+    phase: 'countdown', // 'countdown', 'racing', 'roundEnd', 'gameEnd'
+    round: 1,
+    maxRounds: 3,
+    lapsToWin: 3,
+    countdownValue: 3,
+    countdownTimer: 0,
+    roundEndTimer: 0,
+    p1Wins: 0,
+    p2Wins: 0,
+    roundWinner: null
+};
+
+// ============================================================
+// INPUT HANDLING
+// ============================================================
+
+const keys = {
+    ArrowLeft: false,
+    ArrowRight: false,
+    KeyA: false,
+    KeyD: false
+};
+
+document.addEventListener('keydown', (e) => {
+    if (e.code in keys) {
+        keys[e.code] = true;
+        e.preventDefault();
+    }
+});
+
+document.addEventListener('keyup', (e) => {
+    if (e.code in keys) {
+        keys[e.code] = false;
+        e.preventDefault();
+    }
+});
+
+// ============================================================
+// AUDIO SYSTEM (Web Audio API)
+// ============================================================
+
+let audioCtx = null;
+let engineOsc1 = null;
+let engineOsc2 = null;
+let engineGain1 = null;
+let engineGain2 = null;
+
+function initAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // Player 1 engine
+    engineOsc1 = audioCtx.createOscillator();
+    engineGain1 = audioCtx.createGain();
+    engineOsc1.type = 'sawtooth';
+    engineOsc1.frequency.value = 80;
+    engineGain1.gain.value = 0;
+    engineOsc1.connect(engineGain1);
+    engineGain1.connect(audioCtx.destination);
+    engineOsc1.start();
+    
+    // Player 2 engine
+    engineOsc2 = audioCtx.createOscillator();
+    engineGain2 = audioCtx.createGain();
+    engineOsc2.type = 'sawtooth';
+    engineOsc2.frequency.value = 85;
+    engineGain2.gain.value = 0;
+    engineOsc2.connect(engineGain2);
+    engineGain2.connect(audioCtx.destination);
+    engineOsc2.start();
+}
+
+function updateEngineSound(car, oscGain, osc) {
+    if (!audioCtx || gameState.phase !== 'racing') {
+        if (oscGain) oscGain.gain.value = 0;
+        return;
+    }
+    const baseFreq = 60 + car.speed * 1.5;
+    osc.frequency.setTargetAtTime(baseFreq, audioCtx.currentTime, 0.1);
+    oscGain.gain.setTargetAtTime(0.03, audioCtx.currentTime, 0.1);
+}
+
+function stopEngines() {
+    if (engineGain1) engineGain1.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+    if (engineGain2) engineGain2.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+}
+
+function playCollisionSound() {
+    if (!audioCtx) return;
+    const bufferSize = audioCtx.sampleRate * 0.1;
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.1));
+    }
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.3;
+    source.connect(gain);
+    gain.connect(audioCtx.destination);
+    source.start();
+}
+
+function playLapBeep() {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+    gain.gain.exponentialDecayTo && gain.gain.exponentialDecayTo(0.01, audioCtx.currentTime + 0.15);
+    gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.15);
+}
+
+function playCountdownBeep(isGo = false) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'square';
+    osc.frequency.value = isGo ? 880 : 440;
+    gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    gain.gain.setTargetAtTime(0, audioCtx.currentTime, isGo ? 0.15 : 0.1);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + (isGo ? 0.3 : 0.15));
+}
+
+function playFanfare() {
+    if (!audioCtx) return;
+    const notes = [523, 659, 784, 1047];
+    notes.forEach((freq, i) => {
+        setTimeout(() => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'triangle';
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+            gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.2);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.3);
+        }, i * 150);
+    });
+}
+
+// ============================================================
+// TRACK GENERATION
+// ============================================================
+
+let track = {
+    waypoints: [],
+    path: [],
+    trackWidth: 70,
+    startLineIndex: 0
+};
+
+function generateTrack() {
+    const centerX = WIDTH / 2;
+    const centerY = HEIGHT / 2;
+    const numWaypoints = 6 + Math.floor(Math.random() * 5); // 6-10 waypoints
+    const minRadius = 120;
+    const maxRadius = 220;
+    
+    // Generate random waypoints around center
+    let waypoints = [];
+    for (let i = 0; i < numWaypoints; i++) {
+        const angle = (i / numWaypoints) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
+        const radius = minRadius + Math.random() * (maxRadius - minRadius);
+        waypoints.push({
+            x: centerX + Math.cos(angle) * radius,
+            y: centerY + Math.sin(angle) * radius,
+            angle: angle
+        });
+    }
+    
+    // Sort by angle
+    waypoints.sort((a, b) => a.angle - b.angle);
+    
+    // Generate smooth path using Catmull-Rom spline
+    const path = [];
+    const resolution = 20; // Points per segment
+    
+    for (let i = 0; i < waypoints.length; i++) {
+        const p0 = waypoints[(i - 1 + waypoints.length) % waypoints.length];
+        const p1 = waypoints[i];
+        const p2 = waypoints[(i + 1) % waypoints.length];
+        const p3 = waypoints[(i + 2) % waypoints.length];
+        
+        for (let t = 0; t < resolution; t++) {
+            const tt = t / resolution;
+            const point = catmullRom(p0, p1, p2, p3, tt);
+            path.push(point);
+        }
+    }
+    
+    // Find rightmost point for start line
+    let startIdx = 0;
+    let maxX = -Infinity;
+    for (let i = 0; i < path.length; i++) {
+        if (path[i].x > maxX && Math.abs(path[i].y - centerY) < 80) {
+            maxX = path[i].x;
+            startIdx = i;
+        }
+    }
+    
+    track.waypoints = waypoints;
+    track.path = path;
+    track.startLineIndex = startIdx;
+    
+    return track;
+}
+
+function catmullRom(p0, p1, p2, p3, t) {
+    const t2 = t * t;
+    const t3 = t2 * t;
+    return {
+        x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+    };
+}
+
+function getTrackDirection(index) {
+    const next = (index + 1) % track.path.length;
+    const dx = track.path[next].x - track.path[index].x;
+    const dy = track.path[next].y - track.path[index].y;
+    return Math.atan2(dy, dx);
+}
+
+function distanceToTrack(x, y) {
+    let minDist = Infinity;
+    let closestIdx = 0;
+    for (let i = 0; i < track.path.length; i++) {
+        const dx = x - track.path[i].x;
+        const dy = y - track.path[i].y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < minDist) {
+            minDist = dist;
+            closestIdx = i;
+        }
+    }
+    return { distance: minDist, index: closestIdx };
+}
+
+// ============================================================
+// CAR PHYSICS
+// ============================================================
+
+function createCar(color, playerNum) {
+    const startIdx = track.startLineIndex;
+    const startDir = getTrackDirection(startIdx);
+    const offset = playerNum === 1 ? -15 : 15;
+    const backOffset = playerNum === 1 ? 30 : -30;
+    
+    return {
+        x: track.path[startIdx].x - Math.cos(startDir) * backOffset + Math.cos(startDir + Math.PI/2) * offset,
+        y: track.path[startIdx].y - Math.sin(startDir) * backOffset + Math.sin(startDir + Math.PI/2) * offset,
+        angle: startDir,
+        speed: 0,
+        targetSpeed: 120,
+        turnRate: 0,
+        color: color,
+        width: 24,
+        height: 14,
+        lap: 0,
+        lastCheckpoint: startIdx,
+        crossedStart: false,
+        onTrack: true,
+        vx: 0,
+        vy: 0
+    };
+}
+
+let car1, car2;
+
+function resetCars() {
+    car1 = createCar('#e63946', 1);
+    car2 = createCar('#4895ef', 2);
+}
+
+function updateCar(car, turnLeft, turnRight, dt) {
+    if (gameState.phase !== 'racing') {
+        car.speed = 0;
+        return;
+    }
+    
+    // Steering
+    const turnInput = (turnRight ? 1 : 0) - (turnLeft ? 1 : 0);
+    const maxTurnRate = 3.5;
+    const turnSpeed = 8;
+    
+    car.turnRate += (turnInput * maxTurnRate - car.turnRate) * turnSpeed * dt;
+    car.angle += car.turnRate * (car.speed / car.targetSpeed) * dt;
+    
+    // Speed (auto-accelerate, slow on grass)
+    const trackInfo = distanceToTrack(car.x, car.y);
+    car.onTrack = trackInfo.distance < track.trackWidth / 2;
+    
+    const targetSpd = car.onTrack ? car.targetSpeed : car.targetSpeed * 0.5;
+    car.speed += (targetSpd - car.speed) * (car.onTrack ? 2 : 4) * dt;
+    
+    // Apply velocity with drift
+    const targetVx = Math.cos(car.angle) * car.speed;
+    const targetVy = Math.sin(car.angle) * car.speed;
+    const grip = car.onTrack ? 0.92 : 0.85;
+    
+    car.vx = car.vx * (1 - grip) + targetVx * grip;
+    car.vy = car.vy * (1 - grip) + targetVy * grip;
+    
+    car.x += car.vx * dt;
+    car.y += car.vy * dt;
+    
+    // Keep on screen
+    car.x = Math.max(20, Math.min(WIDTH - 20, car.x));
+    car.y = Math.max(20, Math.min(HEIGHT - 20, car.y));
+    
+    // Push back to track if too far off
+    if (trackInfo.distance > track.trackWidth) {
+        const pushStrength = 0.1;
+        const targetPoint = track.path[trackInfo.index];
+        car.x += (targetPoint.x - car.x) * pushStrength;
+        car.y += (targetPoint.y - car.y) * pushStrength;
+    }
+}
+
+function checkCarCollision() {
+    const dx = car2.x - car1.x;
+    const dy = car2.y - car1.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = 20;
+    
+    if (dist < minDist && dist > 0) {
+        // Collision!
+        const overlap = minDist - dist;
+        const nx = dx / dist;
+        const ny = dy / dist;
+        
+        // Push apart
+        car1.x -= nx * overlap * 0.5;
+        car1.y -= ny * overlap * 0.5;
+        car2.x += nx * overlap * 0.5;
+        car2.y += ny * overlap * 0.5;
+        
+        // Bounce impulse
+        const bounceStrength = 80;
+        car1.vx -= nx * bounceStrength;
+        car1.vy -= ny * bounceStrength;
+        car2.vx += nx * bounceStrength;
+        car2.vy += ny * bounceStrength;
+        
+        playCollisionSound();
+    }
+}
+
+function checkLapProgress(car) {
+    const trackInfo = distanceToTrack(car.x, car.y);
+    const currentIdx = trackInfo.index;
+    const pathLen = track.path.length;
+    const startIdx = track.startLineIndex;
+    
+    // Check if crossed start line
+    const nearStart = Math.abs(currentIdx - startIdx) < 5 || Math.abs(currentIdx - startIdx) > pathLen - 5;
+    
+    // Calculate progress around track
+    const progress = (currentIdx - startIdx + pathLen) % pathLen;
+    const lastProgress = (car.lastCheckpoint - startIdx + pathLen) % pathLen;
+    
+    // Must have gone around most of the track
+    if (nearStart && lastProgress > pathLen * 0.7 && progress < pathLen * 0.3) {
+        car.lap++;
+        car.crossedStart = true;
+        playLapBeep();
+        
+        if (car.lap >= gameState.lapsToWin) {
+            endRound(car === car1 ? 1 : 2);
+        }
+    }
+    
+    // Update checkpoint if moving forward
+    if (Math.abs(currentIdx - car.lastCheckpoint) < pathLen / 2) {
+        car.lastCheckpoint = currentIdx;
+    }
+}
+
+// ============================================================
+// GAME FLOW
+// ============================================================
+
+function startRound() {
+    generateTrack();
+    resetCars();
+    gameState.phase = 'countdown';
+    gameState.countdownValue = 3;
+    gameState.countdownTimer = 0;
+    gameState.roundWinner = null;
+}
+
+function endRound(winner) {
+    gameState.phase = 'roundEnd';
+    gameState.roundWinner = winner;
+    gameState.roundEndTimer = 0;
+    stopEngines();
+    
+    if (winner === 1) gameState.p1Wins++;
+    else gameState.p2Wins++;
+    
+    playFanfare();
+}
+
+function nextRound() {
+    if (gameState.round >= gameState.maxRounds) {
+        gameState.phase = 'gameEnd';
+    } else {
+        gameState.round++;
+        startRound();
+    }
+}
+
+function restartGame() {
+    gameState.round = 1;
+    gameState.p1Wins = 0;
+    gameState.p2Wins = 0;
+    startRound();
+}
+
+// ============================================================
+// RENDERING
+// ============================================================
+
+function drawTrack() {
+    // Grass background
+    ctx.fillStyle = '#2d5a27';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    
+    // Add some grass texture
+    ctx.fillStyle = '#265022';
+    for (let i = 0; i < 200; i++) {
+        const x = (i * 137) % WIDTH;
+        const y = (i * 97) % HEIGHT;
+        ctx.fillRect(x, y, 8, 8);
+    }
+    
+    // Track surface (asphalt)
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = track.trackWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(track.path[0].x, track.path[0].y);
+    for (let i = 1; i < track.path.length; i++) {
+        ctx.lineTo(track.path[i].x, track.path[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    
+    // Track edge lines
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([10, 10]);
+    ctx.beginPath();
+    ctx.moveTo(track.path[0].x, track.path[0].y);
+    for (let i = 1; i < track.path.length; i++) {
+        ctx.lineTo(track.path[i].x, track.path[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    ctx.setLineDash([]);
+    
+    // Start/Finish line
+    const startIdx = track.startLineIndex;
+    const startPoint = track.path[startIdx];
+    const startDir = getTrackDirection(startIdx);
+    const perpX = Math.cos(startDir + Math.PI / 2);
+    const perpY = Math.sin(startDir + Math.PI / 2);
+    
+    // Draw checkered pattern
+    const lineWidth = track.trackWidth;
+    const numSquares = 6;
+    const squareSize = lineWidth / numSquares;
+    
+    for (let i = -numSquares / 2; i < numSquares / 2; i++) {
+        for (let j = 0; j < 2; j++) {
+            const isWhite = (i + j) % 2 === 0;
+            ctx.fillStyle = isWhite ? '#fff' : '#111';
+            
+            const cx = startPoint.x + perpX * (i + 0.5) * squareSize + Math.cos(startDir) * (j - 0.5) * squareSize;
+            const cy = startPoint.y + perpY * (i + 0.5) * squareSize + Math.sin(startDir) * (j - 0.5) * squareSize;
+            
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate(startDir);
+            ctx.fillRect(-squareSize / 2, -squareSize / 2, squareSize, squareSize);
+            ctx.restore();
+        }
+    }
+}
+
+function drawCar(car) {
+    ctx.save();
+    ctx.translate(car.x, car.y);
+    ctx.rotate(car.angle);
+    
+    // Car body
+    ctx.fillStyle = car.color;
+    ctx.beginPath();
+    ctx.roundRect(-car.width / 2, -car.height / 2, car.width, car.height, 3);
+    ctx.fill();
+    
+    // Car details
+    ctx.fillStyle = '#111';
+    // Windshield
+    ctx.fillRect(car.width / 2 - 8, -car.height / 2 + 2, 4, car.height - 4);
+    // Rear
+    ctx.fillRect(-car.width / 2, -car.height / 2 + 2, 3, car.height - 4);
+    
+    // Wheels
+    ctx.fillStyle = '#222';
+    ctx.fillRect(-car.width / 2 + 2, -car.height / 2 - 2, 6, 3);
+    ctx.fillRect(-car.width / 2 + 2, car.height / 2 - 1, 6, 3);
+    ctx.fillRect(car.width / 2 - 8, -car.height / 2 - 2, 6, 3);
+    ctx.fillRect(car.width / 2 - 8, car.height / 2 - 1, 6, 3);
+    
+    ctx.restore();
+    
+    // Off-track indicator
+    if (!car.onTrack && gameState.phase === 'racing') {
+        ctx.strokeStyle = '#ff0';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(car.x, car.y, 18, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+}
+
+function drawText(text, x, y, size, color = '#fff') {
+    ctx.font = `bold ${size}px 'Segoe UI', sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    
+    // Outline
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 4;
+    ctx.strokeText(text, x, y);
+    
+    // Fill
+    ctx.fillStyle = color;
+    ctx.fillText(text, x, y);
+}
+
+function drawUI() {
+    // Top bar background
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, WIDTH, 50);
+    
+    // Player 1 info
+    ctx.fillStyle = '#e63946';
+    ctx.fillRect(15, 10, 8, 30);
+    drawText(`LAP ${Math.min(car1.lap + 1, gameState.lapsToWin)}/${gameState.lapsToWin}`, 80, 25, 16, '#fff');
+    
+    // Round info
+    drawText(`ROUND ${gameState.round}/${gameState.maxRounds}`, WIDTH / 2, 25, 20, '#fff');
+    
+    // Player 2 info
+    ctx.fillStyle = '#4895ef';
+    ctx.fillRect(WIDTH - 23, 10, 8, 30);
+    drawText(`LAP ${Math.min(car2.lap + 1, gameState.lapsToWin)}/${gameState.lapsToWin}`, WIDTH - 90, 25, 16, '#fff');
+    
+    // Round wins
+    const dotRadius = 8;
+    const dotSpacing = 22;
+    const p1DotsX = 160;
+    const p2DotsX = WIDTH - 170;
+    
+    for (let i = 0; i < gameState.maxRounds; i++) {
+        // P1 dots
+        ctx.beginPath();
+        ctx.arc(p1DotsX + i * dotSpacing, 25, dotRadius, 0, Math.PI * 2);
+        ctx.fillStyle = i < gameState.p1Wins ? '#e63946' : '#555';
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        // P2 dots
+        ctx.beginPath();
+        ctx.arc(p2DotsX + i * dotSpacing, 25, dotRadius, 0, Math.PI * 2);
+        ctx.fillStyle = i < gameState.p2Wins ? '#4895ef' : '#555';
+        ctx.fill();
+        ctx.stroke();
+    }
+    
+    // Controls at bottom
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(0, HEIGHT - 30, WIDTH, 30);
+    drawText('P1: ← →', 100, HEIGHT - 15, 14, '#e63946');
+    drawText('P2: A D', WIDTH - 100, HEIGHT - 15, 14, '#4895ef');
+}
+
+function drawCountdown() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    
+    if (gameState.countdownValue > 0) {
+        drawText(gameState.countdownValue.toString(), WIDTH / 2, HEIGHT / 2, 120, '#fff');
+    } else {
+        drawText('GO!', WIDTH / 2, HEIGHT / 2, 100, '#0f0');
+    }
+}
+
+function drawRoundEnd() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    
+    const winnerColor = gameState.roundWinner === 1 ? '#e63946' : '#4895ef';
+    drawText(`PLAYER ${gameState.roundWinner} WINS!`, WIDTH / 2, HEIGHT / 2 - 30, 48, winnerColor);
+    drawText(`Round ${gameState.round}/${gameState.maxRounds}`, WIDTH / 2, HEIGHT / 2 + 30, 24, '#fff');
+}
+
+function drawGameEnd() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    
+    let winner, color;
+    if (gameState.p1Wins > gameState.p2Wins) {
+        winner = 'PLAYER 1';
+        color = '#e63946';
+    } else if (gameState.p2Wins > gameState.p1Wins) {
+        winner = 'PLAYER 2';
+        color = '#4895ef';
+    } else {
+        winner = 'TIE';
+        color = '#fff';
+    }
+    
+    drawText('🏆 RACE OVER 🏆', WIDTH / 2, HEIGHT / 2 - 80, 36, '#ffd700');
+    drawText(`${winner} WINS!`, WIDTH / 2, HEIGHT / 2, 56, color);
+    drawText(`${gameState.p1Wins} - ${gameState.p2Wins}`, WIDTH / 2, HEIGHT / 2 + 60, 40, '#fff');
+    drawText('Press SPACE to play again', WIDTH / 2, HEIGHT / 2 + 120, 20, '#aaa');
+}
+
+// ============================================================
+// GAME LOOP
+// ============================================================
+
+let lastTime = 0;
+let lastCountdownBeep = -1;
+
+function gameLoop(timestamp) {
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+    
+    // Initialize audio on first frame (needs user interaction proxy)
+    initAudio();
+    
+    // Update based on phase
+    switch (gameState.phase) {
+        case 'countdown':
+            gameState.countdownTimer += dt;
+            const newValue = 3 - Math.floor(gameState.countdownTimer);
+            
+            if (newValue !== lastCountdownBeep && newValue >= 0) {
+                playCountdownBeep(newValue === 0);
+                lastCountdownBeep = newValue;
+            }
+            
+            gameState.countdownValue = Math.max(0, newValue);
+            
+            if (gameState.countdownTimer >= 4) {
+                gameState.phase = 'racing';
+            }
+            break;
+            
+        case 'racing':
+            updateCar(car1, keys.ArrowLeft, keys.ArrowRight, dt);
+            updateCar(car2, keys.KeyA, keys.KeyD, dt);
+            checkCarCollision();
+            checkLapProgress(car1);
+            checkLapProgress(car2);
+            updateEngineSound(car1, engineGain1, engineOsc1);
+            updateEngineSound(car2, engineGain2, engineOsc2);
+            break;
+            
+        case 'roundEnd':
+            gameState.roundEndTimer += dt;
+            if (gameState.roundEndTimer >= 3) {
+                nextRound();
+                lastCountdownBeep = -1;
+            }
+            break;
+            
+        case 'gameEnd':
+            // Wait for space to restart
+            break;
+    }
+    
+    // Render
+    drawTrack();
+    drawCar(car1);
+    drawCar(car2);
+    drawUI();
+    
+    if (gameState.phase === 'countdown') {
+        drawCountdown();
+    } else if (gameState.phase === 'roundEnd') {
+        drawRoundEnd();
+    } else if (gameState.phase === 'gameEnd') {
+        drawGameEnd();
+    }
+    
+    requestAnimationFrame(gameLoop);
+}
+
+// Space to restart
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && gameState.phase === 'gameEnd') {
+        restartGame();
+    }
+    // Click also initializes audio
+    initAudio();
+});
+
+// Click to init audio
+canvas.addEventListener('click', initAudio);
+
+// ============================================================
+// START GAME
+// ============================================================
+
+startRound();
+requestAnimationFrame(gameLoop);
+
+    </script>
+</body>
+</html>
