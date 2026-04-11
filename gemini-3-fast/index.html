@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neon Hotseat Racer</title>
+    <style>
+        body {
+            background: #222;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            color: white;
+            font-family: sans-serif;
+            overflow: hidden;
+        }
+        canvas {
+            border: 4px solid #444;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            background-color: #2d5a27; /* Grass color */
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script>
+/** * GLOBALS & CONSTANTS 
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const TRACK_WIDTH = 55;
+const LAP_GOAL = 3;
+const TOTAL_ROUNDS = 3;
+
+let gameState = 'STARTUP'; // STARTUP, COUNTDOWN, RACING, ROUND_END, GAME_OVER
+let round = 1;
+let p1Wins = 0;
+let p2Wins = 0;
+let countdownTimer = 3;
+let lastTime = 0;
+
+/** * AUDIO SYSTEM (Web Audio API)
+ */
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playSound(type, freq = 440, duration = 0.1, volume = 0.1) {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    
+    gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+    
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+function playThud() {
+    const bufferSize = audioCtx.sampleRate * 0.1;
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = buffer;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 400;
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+    noise.connect(filter); filter.connect(gain); gain.connect(audioCtx.destination);
+    noise.start();
+}
+
+/** * TRACK GENERATION 
+ */
+let trackPoints = [];
+let finishLine = { x1: 0, y1: 0, x2: 0, y2: 0, angle: 0 };
+
+function generateTrack() {
+    const center = { x: 400, y: 300 };
+    const numPoints = 8 + Math.floor(Math.random() * 3);
+    const points = [];
+    
+    for (let i = 0; i < numPoints; i++) {
+        const angle = (i / numPoints) * Math.PI * 2;
+        const dist = 180 + Math.random() * 100;
+        points.push({
+            x: center.x + Math.cos(angle) * dist,
+            y: center.y + Math.sin(angle) * dist
+        });
+    }
+    trackPoints = points;
+    
+    // Set Finish Line at the first segment
+    const p1 = trackPoints[0];
+    const p2 = trackPoints[1];
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const angle = Math.atan2(dy, dx);
+    const perp = angle + Math.PI / 2;
+    
+    finishLine = {
+        x1: p1.x + Math.cos(perp) * (TRACK_WIDTH/2 + 5),
+        y1: p1.y + Math.sin(perp) * (TRACK_WIDTH/2 + 5),
+        x2: p1.x - Math.cos(perp) * (TRACK_WIDTH/2 + 5),
+        y2: p1.y - Math.sin(perp) * (TRACK_WIDTH/2 + 5),
+        angle: angle
+    };
+}
+
+/**
+ * PHYSICS & CARS
+ */
+class Car {
+    constructor(color, controls, x, y, angle) {
+        this.color = color;
+        this.controls = controls;
+        this.reset(x, y, angle);
+    }
+
+    reset(x, y, angle) {
+        this.x = x;
+        this.y = y;
+        this.angle = angle;
+        this.speed = 0;
+        this.laps = 0;
+        this.onTrack = true;
+        this.checkpoint = false; // Mid-track check to prevent finish line cheesing
+    }
+
+    update(dt, keys) {
+        if (gameState !== 'RACING') {
+            this.speed = 0;
+            return;
+        }
+
+        const targetSpeed = this.onTrack ? 4 : 1.5;
+        this.speed += (targetSpeed - this.speed) * 0.1;
+
+        if (keys[this.controls.left]) this.angle -= 0.05 * (this.speed / 4);
+        if (keys[this.controls.right]) this.angle += 0.05 * (this.speed / 4);
+
+        this.x += Math.cos(this.angle) * this.speed;
+        this.y += Math.sin(this.angle) * this.speed;
+
+        // Boundary Check (Off-road detection)
+        this.checkOffRoad();
+        
+        // Lap Logic
+        this.checkLap();
+    }
+
+    checkOffRoad() {
+        let minStrokeDist = 999;
+        for (let i = 0; i < trackPoints.length; i++) {
+            const p1 = trackPoints[i];
+            const p2 = trackPoints[(i + 1) % trackPoints.length];
+            const d = this.distToSegment(this.x, this.y, p1.x, p1.y, p2.x, p2.y);
+            minStrokeDist = Math.min(minStrokeDist, d);
+        }
+        this.onTrack = minStrokeDist < TRACK_WIDTH / 2;
+    }
+
+    distToSegment(px, py, x1, y1, x2, y2) {
+        const l2 = (x1 - x2) ** 2 + (y1 - y2) ** 2;
+        if (l2 === 0) return Math.sqrt((px - x1) ** 2 + (py - y1) ** 2);
+        let t = ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / l2;
+        t = Math.max(0, Math.min(1, t));
+        return Math.sqrt((px - (x1 + t * (x2 - x1))) ** 2 + (py - (y1 + t * (y2 - y1))) ** 2);
+    }
+
+    checkLap() {
+        const distToStart = Math.sqrt((this.x - trackPoints[0].x)**2 + (this.y - trackPoints[0].y)**2);
+        const distToMid = Math.sqrt((this.x - trackPoints[Math.floor(trackPoints.length/2)].x)**2 + (this.y - trackPoints[Math.floor(trackPoints.length/2)].y)**2);
+
+        if (distToMid < TRACK_WIDTH) this.checkpoint = true;
+
+        if (distToStart < TRACK_WIDTH && this.checkpoint) {
+            this.laps++;
+            this.checkpoint = false;
+            playSound('square', 600, 0.2, 0.05);
+            if (this.laps >= LAP_GOAL) endRound(this);
+        }
+    }
+}
+
+const p1 = new Car('#ff4444', { left: 'ArrowLeft', right: 'ArrowRight' }, 0, 0, 0);
+const p2 = new Car('#4444ff', { left: 'KeyA', right: 'KeyD' }, 0, 0, 0);
+const keys = {};
+
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'STARTUP') startNewRound();
+});
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+/**
+ * GAME FLOW
+ */
+function startNewRound() {
+    generateTrack();
+    const startX = trackPoints[0].x;
+    const startY = trackPoints[0].y;
+    const startAngle = finishLine.angle;
+
+    p1.reset(startX - Math.sin(startAngle)*15, startY + Math.cos(startAngle)*15, startAngle);
+    p2.reset(startX + Math.sin(startAngle)*15, startY - Math.cos(startAngle)*15, startAngle);
+    
+    gameState = 'COUNTDOWN';
+    countdownTimer = 3;
+    
+    const countInterval = setInterval(() => {
+        if (countdownTimer > 0) {
+            playSound('sine', 400, 0.1);
+            countdownTimer--;
+        } else {
+            playSound('sine', 800, 0.3);
+            gameState = 'RACING';
+            clearInterval(countInterval);
+        }
+    }, 1000);
+}
+
+function endRound(winner) {
+    if (gameState !== 'RACING') return;
+    gameState = 'ROUND_END';
+    winner === p1 ? p1Wins++ : p2Wins++;
+    playSound('triangle', 500, 0.5, 0.2);
+
+    setTimeout(() => {
+        if (round < TOTAL_ROUNDS) {
+            round++;
+            startNewRound();
+        } else {
+            gameState = 'GAME_OVER';
+        }
+    }, 3000);
+}
+
+function resolveCollision(c1, c2) {
+    const dx = c2.x - c1.x;
+    const dy = c2.y - c1.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist < 15) {
+        const angle = Math.atan2(dy, dx);
+        const tx = c1.x + Math.cos(angle) * 15;
+        const ty = c1.y + Math.sin(angle) * 15;
+        const ax = (tx - c2.x) * 0.5;
+        const ay = (ty - c2.y) * 0.5;
+        c1.x -= ax; c1.y -= ay;
+        c2.x += ax; c2.y += ay;
+        playThud();
+    }
+}
+
+/**
+ * RENDERING
+ */
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw Track
+    ctx.beginPath();
+    ctx.strokeStyle = '#444'; // Asphalt
+    ctx.lineWidth = TRACK_WIDTH;
+    ctx.lineJoin = 'round';
+    ctx.moveTo(trackPoints[0].x, trackPoints[0].y);
+    trackPoints.forEach(p => ctx.lineTo(p.x, p.y));
+    ctx.closePath();
+    ctx.stroke();
+
+    // Draw Lane Markings
+    ctx.setLineDash([15, 15]);
+    ctx.strokeStyle = '#ddd';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Draw Finish Line
+    ctx.save();
+    ctx.translate(finishLine.x1, finishLine.y1);
+    ctx.rotate(finishLine.angle + Math.PI/2);
+    for(let i=0; i<4; i++) {
+        for(let j=0; j<2; j++) {
+            ctx.fillStyle = (i+j)%2 === 0 ? 'white' : 'black';
+            ctx.fillRect(j*10, i*13, 10, 15);
+        }
+    }
+    ctx.restore();
+
+    // Draw Cars
+    [p1, p2].forEach(c => {
+        ctx.save();
+        ctx.translate(c.x, c.y);
+        ctx.rotate(c.angle);
+        ctx.fillStyle = c.color;
+        ctx.fillRect(-10, -6, 20, 12);
+        ctx.fillStyle = 'black'; // Windshield
+        ctx.fillRect(2, -4, 4, 8);
+        ctx.restore();
+    });
+
+    // UI Overlay
+    drawUI();
+
+    requestAnimationFrame(gameLoop);
+}
+
+function drawUI() {
+    ctx.font = 'bold 20px Arial';
+    ctx.textAlign = 'center';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'black';
+    
+    // Top Bar
+    ctx.strokeText(`P1 Laps: ${p1.laps}/${LAP_GOAL}  |  Round ${round}/${TOTAL_ROUNDS}  |  P2 Laps: ${p2.laps}/${LAP_GOAL}`, 400, 30);
+    ctx.fillText(`P1 Laps: ${p1.laps}/${LAP_GOAL}  |  Round ${round}/${TOTAL_ROUNDS}  |  P2 Laps: ${p2.laps}/${LAP_GOAL}`, 400, 30);
+
+    // Win Dots
+    for(let i=0; i<3; i++) {
+        ctx.fillStyle = i < p1Wins ? p1.color : '#333';
+        ctx.beginPath(); ctx.arc(300 + i*20, 50, 6, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = i < p2Wins ? p2.color : '#333';
+        ctx.beginPath(); ctx.arc(460 + i*20, 50, 6, 0, Math.PI*2); ctx.fill();
+    }
+
+    // Screens
+    ctx.font = 'bold 60px Arial';
+    if (gameState === 'STARTUP') {
+        ctx.strokeText("PRESS ANY KEY", 400, 300);
+        ctx.fillText("PRESS ANY KEY", 400, 300);
+    } else if (gameState === 'COUNTDOWN') {
+        let txt = countdownTimer === 0 ? "GO!" : countdownTimer;
+        ctx.strokeText(txt, 400, 300);
+        ctx.fillText(txt, 400, 300);
+    } else if (gameState === 'ROUND_END') {
+        ctx.strokeText("ROUND OVER", 400, 300);
+        ctx.fillText("ROUND OVER", 400, 300);
+    } else if (gameState === 'GAME_OVER') {
+        let winner = p1Wins > p2Wins ? "PLAYER 1" : "PLAYER 2";
+        ctx.strokeText(`${winner} WINS THE RACE!`, 400, 300);
+        ctx.fillText(`${winner} WINS THE RACE!`, 400, 300);
+    }
+
+    // Controls footer
+    ctx.font = '14px Arial';
+    ctx.fillStyle = 'white';
+    ctx.fillText("P1: Left/Right Arrows | P2: A/D Keys", 400, 580);
+}
+
+function gameLoop(t) {
+    const dt = t - lastTime;
+    lastTime = t;
+
+    p1.update(dt, keys);
+    p2.update(dt, keys);
+    resolveCollision(p1, p2);
+
+    draw();
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
