@@ -21,21 +21,22 @@ Each directory contains one model's single-file attempt. Open the HTML file dire
 
 | Model              | File                                           |
 | ------------------ | ---------------------------------------------- |
-| Claude Opus        | [`opus/index.html`](./opus/index.html)                     |
+| Claude Opus 4.6    | [`opus-4.6/index.html`](./opus-4.6/index.html)             |
+| Claude Opus 4.5    | [`opus-4.5/index.html`](./opus-4.5/index.html)             |
 | Gemini 3.1 Pro     | [`gemini-3.1-pro/index.html`](./gemini-3.1-pro/index.html) |
 | Gemini 3 Fast      | [`gemini-3-fast/index.html`](./gemini-3-fast/index.html)   |
 | Grok 4.2 Expert    | [`grok-4.2-expert/index.html`](./grok-4.2-expert/index.html) |
-| GLM 5.1            | [`glm5.1/index.html`](./glm5.1/index.html)                 |
-| MiniMax            | [`minimax/racing.html`](./minimax/racing.html)             |
+| GLM 5.1            | [`glm-5.1/index.html`](./glm-5.1/index.html)               |
+| MiniMax 2.5        | [`minimax-2.5/racing.html`](./minimax-2.5/racing.html)     |
 
-MiniMax also produced a [`SPEC.md`](./minimax/SPEC.md) alongside its implementation.
+MiniMax 2.5 also produced a [`SPEC.md`](./minimax-2.5/SPEC.md) alongside its implementation.
 
 ## Running
 
 No tooling required. Open any of the HTML files in a modern browser:
 
 ```sh
-open opus/index.html
+open opus-4.6/index.html
 ```
 
 Click the canvas once if the browser blocks audio until a user gesture.

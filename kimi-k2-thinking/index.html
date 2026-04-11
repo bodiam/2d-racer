@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>2D Hotseat Racing</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #1a1a1a;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+        }
+        canvas {
+            border: 4px solid #333;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+            background: #2d5016;
+        }
+    </style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script>
+/**
+ * 2D TOP-DOWN RACING GAME
+ * Hotseat 2-Player | Random Tracks | Web Audio API
+ */
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// ==================== AUDIO SYSTEM ====================
+class AudioSys {
+    constructor() {
+        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        this.engineOsc = null;
+        this.engineGain = null;
+        this.enabled = false;
+    }
+
+    init() {
+        if (this.enabled) return;
+        this.enabled = true;
+        this.startEngine();
+    }
+
+    // Engine hum: varies pitch with speed
+    startEngine() {
+        if (!this.enabled) return;
+        this.engineOsc = this.ctx.createOscillator();
+        this.engineGain = this.ctx.createGain();
+        this.engineOsc.type = 'sawtooth';
+        this.engineOsc.frequency.value = 80;
+        this.engineGain.gain.value = 0.05;
+        this.engineOsc.connect(this.engineGain);
+        this.engineGain.connect(this.ctx.destination);
+        this.engineOsc.start();
+    }
+
+    updateEngine(speed, maxSpeed) {
+        if (!this.enabled || !this.engineOsc) return;
+        const normalizedSpeed = speed / maxSpeed;
+        this.engineOsc.frequency.setValueAtTime(80 + (normalizedSpeed * 120), this.ctx.currentTime);
+    }
+
+    // Beep for countdown, laps, etc.
+    beep(freq = 440, duration = 0.1, type = 'square') {
+        if (!this.enabled) return;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = type;
+        osc.frequency.value = freq;
+        gain.gain.value = 0.1;
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start();
+        gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+        osc.stop(this.ctx.currentTime + duration);
+    }
+
+    // Collision thud: noise burst
+    thud() {
+        if (!this.enabled) return;
+        const bufferSize = this.ctx.sampleRate * 0.1;
+        const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) {
+            data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.2));
+        }
+        const noise = this.ctx.createBufferSource();
+        noise.buffer = buffer;
+        const gain = this.ctx.createGain();
+        gain.gain.value = 0.3;
+        noise.connect(gain);
+        gain.connect(this.ctx.destination);
+        noise.start();
+    }
+
+    // Fanfare for round win
+    fanfare() {
+        if (!this.enabled) return;
+        [523.25, 659.25, 783.99, 1046.50].forEach((freq, i) => {
+            setTimeout(() => this.beep(freq, 0.3, 'triangle'), i * 100);
+        });
+    }
+
+    // Countdown sequence
+    countdownBeep(num) {
+        if (!this.enabled) return;
+        if (num === 'GO') {
+            this.beep(880, 0.4, 'square');
+        } else {
+            this.beep(440, 0.15, 'sine');
+        }
+    }
+}
+
+const audio = new AudioSys();
+
+// ==================== TRACK GENERATION ====================
+class Track {
+    constructor() {
+        this.points = [];
+        this.centerLine = [];
+        this.leftBorder = [];
+        this.rightBorder = [];
+        this.width = 120;
+        this.finishLine = null;
+        this.generate();
+    }
+
+    generate() {
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
+        const numPoints = 6 + Math.floor(Math.random() * 5); // 6-10 points
+        
+        // Generate random waypoints in a rough circle
+        const waypoints = [];
+        for (let i = 0; i < numPoints; i++) {
+            const angle = (i / numPoints) * Math.PI * 2 + (Math.random() * 0.5);
+            const radius = 180 + Math.random() * 120;
+            waypoints.push({
+                x: centerX + Math.cos(angle) * radius,
+                y: centerY + Math.sin(angle) * radius
+            });
+        }
+
+        // Create smooth closed curve using Catmull-Rom splines
+        this.centerLine = [];
+        const resolution = 10; // Points per segment
+        
+        for (let i = 0; i < waypoints.length; i++) {
+            const p0 = waypoints[(i - 1 + waypoints.length) % waypoints.length];
+            const p1 = waypoints[i];
+            const p2 = waypoints[(i + 1) % waypoints.length];
+            const p3 = waypoints[(i + 2) % waypoints.length];
+
+            for (let t = 0; t < 1; t += 1/resolution) {
+                const point = this.catmullRom(p0, p1, p2, p3, t);
+                this.centerLine.push(point);
+            }
+        }
+
+        // Calculate borders (perpendicular to direction)
+        this.leftBorder = [];
+        this.rightBorder = [];
+        
+        for (let i = 0; i < this.centerLine.length; i++) {
+            const prev = this.centerLine[(i - 1 + this.centerLine.length) % this.centerLine.length];
+            const curr = this.centerLine[i];
+            const next = this.centerLine[(i + 1) % this.centerLine.length];
+            
+            // Calculate direction vector
+            const dx = next.x - prev.x;
+            const dy = next.y - prev.y;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            const nx = -dy / len; // Perpendicular normal
+            const ny = dx / len;
+            
+            this.leftBorder.push({
+                x: curr.x + nx * (this.width / 2),
+                y: curr.y + ny * (this.width / 2)
+            });
+            
+            this.rightBorder.push({
+                x: curr.x - nx * (this.width / 2),
+                y: curr.y - ny * (this.width / 2)
+            });
+        }
+
+        // Set finish line at index 0
+        const p1 = this.centerLine[0];
+        const p2 = this.centerLine[1];
+        this.finishLine = {
+            x1: this.leftBorder[0].x,
+            y1: this.leftBorder[0].y,
+            x2: this.rightBorder[0].x,
+            y2: this.rightBorder[0].y,
+            cx: (this.leftBorder[0].x + this.rightBorder[0].x) / 2,
+            cy: (this.leftBorder[0].y + this.rightBorder[0].y) / 2,
+            dx: p2.x - p1.x,
+            dy: p2.y - p1.y
+        };
+    }
+
+    catmullRom(p0, p1, p2, p3, t) {
+        const t2 = t * t;
+        const t3 = t2 * t;
+        
+        return {
+            x: 0.5 * ((2 * p1.x) +
+                     (-p0.x + p2.x) * t +
+                     (2*p0.x - 5*p1.x + 4*p2.x - p3.x) * t2 +
+                     (-p0.x + 3*p1.x - 3*p2.x + p3.x) * t3),
+            y: 0.5 * ((2 * p1.y) +
+                     (-p0.y + p2.y) * t +
+                     (2*p0.y - 5*p1.y + 4*p2.y - p3.y) * t2 +
+                     (-p0.y + 3*p1.y - 3*p2.y + p3.y) * t3)
+        };
+    }
+
+    // Check if point is on track and return distance from centerline
+    getTrackDistance(x, y) {
+        let minDist = Infinity;
+        let onTrack = false;
+        
+        // Find closest point on centerline (simplified: check every 5th point)
+        for (let i = 0; i < this.centerLine.length; i += 5) {
+            const p = this.centerLine[i];
+            const dist = Math.sqrt((x - p.x)**2 + (y - p.y)**2);
+            if (dist < minDist) {
+                minDist = dist;
+            }
+        }
+        
+        return {
+            distance: minDist,
+            onTrack: minDist < (this.width / 2 - 10)
+        };
+    }
+
+    // Check finish line crossing
+    checkFinishLine(x, y, prevX, prevY) {
+        // Line segment intersection
+        const f = this.finishLine;
+        const denom = (f.y2 - f.y1) * (x - prevX) - (f.x2 - f.x1) * (y - prevY);
+        if (denom === 0) return false;
+        
+        const t = ((f.x2 - f.x1) * (prevY - f.y1) - (f.y2 - f.y1) * (prevX - f.x1)) / denom;
+        const u = -((x - prevX) * (prevY - f.y1) - (y - prevY) * (prevX - f.x1)) / denom;
+        
+        if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+            // Check direction (must be going in positive track direction)
+            const dx = x - prevX;
+            const dy = y - prevY;
+            const dot = dx * f.dx + dy * f.dy;
+            return dot > 0; // Moving in correct direction
+        }
+        return false;
+    }
+
+    draw(ctx) {
+        // Draw grass/dirt background (already canvas bg, but add texture)
+        ctx.fillStyle = '#2d5016';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Draw track surface (asphalt)
+        ctx.beginPath();
+        ctx.moveTo(this.leftBorder[0].x, this.leftBorder[0].y);
+        for (let i = 1; i < this.leftBorder.length; i++) {
+            ctx.lineTo(this.leftBorder[i].x, this.leftBorder[i].y);
+        }
+        ctx.closePath();
+        
+        ctx.moveTo(this.rightBorder[0].x, this.rightBorder[0].y);
+        for (let i = this.rightBorder.length - 1; i >= 0; i--) {
+            ctx.lineTo(this.rightBorder[i].x, this.rightBorder[i].y);
+        }
+        ctx.closePath();
+        
+        ctx.fillStyle = '#333';
+        ctx.fill();
+
+        // Draw borders
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        for (let i = 0; i < this.leftBorder.length; i++) {
+            if (i === 0) ctx.moveTo(this.leftBorder[i].x, this.leftBorder[i].y);
+            else ctx.lineTo(this.leftBorder[i].x, this.leftBorder[i].y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        ctx.beginPath();
+        for (let i = 0; i < this.rightBorder.length; i++) {
+            if (i === 0) ctx.moveTo(this.rightBorder[i].x, this.rightBorder[i].y);
+            else ctx.lineTo(this.rightBorder[i].x, this.rightBorder[i].y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        // Draw center line (dashed)
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([20, 20]);
+        ctx.beginPath();
+        for (let i = 0; i < this.centerLine.length; i++) {
+            if (i === 0) ctx.moveTo(this.centerLine[i].x, this.centerLine[i].y);
+            else ctx.lineTo(this.centerLine[i].x, this.centerLine[i].y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Draw finish line (checkered)
+        const f = this.finishLine;
+        const angle = Math.atan2(f.y2 - f.y1, f.x2 - f.x1);
+        ctx.save();
+        ctx.translate(f.cx, f.cy);
+        ctx.rotate(angle);
+        
+        const checkSize = 10;
+        const width = this.width;
+        for (let x = -width/2; x < width/2; x += checkSize) {
+            for (let y = -checkSize; y < checkSize; y += checkSize) {
+                ctx.fillStyle = ((x/checkSize + y/checkSize) % 2 === 0) ? '#fff' : '#000';
+                ctx.fillRect(x, y, checkSize, checkSize);
+            }
+        }
+        ctx.restore();
+    }
+}
+
+// ==================== CAR ====================
+class Car {
+    constructor(color, startX, startY, controls) {
+        this.color = color;
+        this.x = startX;
+        this.y = startY;
+        this.angle = 0;
+        this.speed = 0;
+        this.vx = 0;
+        this.vy = 0;
+        this.radius = 12;
+        this.maxSpeed = 6;
+        this.accel = 0.15;
+        this.turnSpeed = 0.08;
+        this.grip = 0.92; // Drift factor
+        this.controls = controls; // {left, right}
+        
+        this.lap = 0;
+        this.roundWins = 0;
+        this.finished = false;
+        this.offTrackTimer = 0;
+    }
+
+    update(input, track) {
+        if (this.finished) return;
+
+        // Auto-accelerate
+        if (this.speed < this.maxSpeed) {
+            this.speed += this.accel;
+        }
+
+        // Steering
+        if (input[this.controls.left]) {
+            this.angle -= this.turnSpeed * (this.speed / this.maxSpeed);
+        }
+        if (input[this.controls.right]) {
+            this.angle += this.turnSpeed * (this.speed / this.maxSpeed);
+        }
+
+        // Calculate target velocity based on angle
+        const targetVx = Math.cos(this.angle) * this.speed;
+        const targetVy = Math.sin(this.angle) * this.speed;
+
+        // Apply grip/drift physics
+        this.vx = this.vx * this.grip + targetVx * (1 - this.grip);
+        this.vy = this.vy * this.grip + targetVy * (1 - this.grip);
+
+        // Store previous position for lap detection
+        const prevX = this.x;
+        const prevY = this.y;
+
+        // Update position
+        this.x += this.vx;
+        this.y += this.vy;
+
+        // Track collision
+        const trackData = track.getTrackDistance(this.x, this.y);
+        if (!trackData.onTrack) {
+            // Push back toward centerline
+            const angleToCenter = Math.atan2(300 - this.y, 400 - this.x);
+            this.x += Math.cos(angleToCenter) * 2;
+            this.y += Math.sin(angleToCenter) * 2;
+            this.speed *= 0.95; // Slow down on grass
+            this.offTrackTimer++;
+        } else {
+            this.offTrackTimer = 0;
+        }
+
+        // Check lap completion
+        if (track.checkFinishLine(this.x, this.y, prevX, prevY)) {
+            this.lap++;
+            audio.beep(600, 0.1, 'sine');
+            return true; // Lap completed
+        }
+
+        return false;
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.angle);
+
+        // Car body
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.roundRect(-10, -6, 20, 12, 3);
+        ctx.fill();
+
+        // Car details (windshield)
+        ctx.fillStyle = '#222';
+        ctx.fillRect(-2, -4, 8, 8);
+
+        // Wheels
+        ctx.fillStyle = '#111';
+        ctx.fillRect(-8, -7, 6, 3);
+        ctx.fillRect(-8, 4, 6, 3);
+        ctx.fillRect(2, -7, 6, 3);
+        ctx.fillRect(2, 4, 6, 3);
+
+        ctx.restore();
+    }
+
+    checkCollision(other) {
+        const dx = other.x - this.x;
+        const dy = other.y - this.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        const minDist = this.radius + other.radius;
+
+        if (dist < minDist) {
+            // Push apart
+            const overlap = minDist - dist;
+            const nx = dx / dist;
+            const ny = dy / dist;
+            
+            this.x -= nx * overlap * 0.5;
+            this.y -= ny * overlap * 0.5;
+            other.x += nx * overlap * 0.5;
+            other.y += ny * overlap * 0.5;
+
+            // Bounce velocities
+            const tempVx = this.vx;
+            const tempVy = this.vy;
+            this.vx = other.vx * 0.5;
+            this.vy = other.vy * 0.5;
+            other.vx = tempVx * 0.5;
+            other.vy = tempVy * 0.5;
+
+            this.speed *= 0.9;
+            other.speed *= 0.9;
+
+            audio.thud();
+        }
+    }
+
+    reset(x, y) {
+        this.x = x;
+        this.y = y;
+        this.angle = Math.atan2(300 - y, 400 - x); // Point toward center roughly
+        this.speed = 0;
+        this.vx = 0;
+        this.vy = 0;
+        this.lap = 0;
+        this.finished = false;
+    }
+}
+
+// ==================== GAME ====================
+class Game {
+    constructor() {
+        this.track = new Track();
+        this.car1 = new Car('#e74c3c', 350, 300, {left: 'ArrowLeft', right: 'ArrowRight'});
+        this.car2 = new Car('#3498db', 450, 300, {left: 'KeyA', right: 'KeyD'});
+        this.cars = [this.car1, this.car2];
+        
+        this.keys = {};
+        this.state = 'countdown'; // countdown, racing, roundEnd, gameEnd
+        this.round = 1;
+        this.maxRounds = 3;
+        this.lapsToWin = 3;
+        this.countdownValue = 3;
+        this.countdownTimer = 0;
+        this.roundWinner = null;
+        this.gameWinner = null;
+        this.pauseTimer = 0;
+
+        this.setupInput();
+        this.startCountdown();
+        this.loop();
+    }
+
+    setupInput() {
+        window.addEventListener('keydown', (e) => {
+            this.keys[e.code] = true;
+            if (!audio.enabled && (e.code === 'ArrowLeft' || e.code === 'ArrowRight' || e.code === 'KeyA' || e.code === 'KeyD')) {
+                audio.init();
+            }
+        });
+        window.addEventListener('keyup', (e) => {
+            this.keys[e.code] = false;
+        });
+    }
+
+    startCountdown() {
+        this.state = 'countdown';
+        this.countdownValue = 3;
+        this.countdownTimer = Date.now();
+        this.cars.forEach(car => {
+            car.reset(car.x, car.y);
+            // Position at start line with offset
+            const f = this.track.finishLine;
+            const offset = car === this.car1 ? -30 : 30;
+            car.x = f.cx - f.dy * 0.5 + f.dx * offset * 0.01;
+            car.y = f.cy + f.dx * 0.5 + f.dy * offset * 0.01;
+            car.angle = Math.atan2(f.dy, f.dx);
+        });
+        
+        this.runCountdown();
+    }
+
+    runCountdown() {
+        if (this.countdownValue > 0) {
+            audio.countdownBeep(this.countdownValue);
+            setTimeout(() => {
+                this.countdownValue--;
+                if (this.countdownValue === 0) {
+                    this.countdownValue = 'GO';
+                    audio.countdownBeep('GO');
+                    setTimeout(() => {
+                        this.state = 'racing';
+                        this.countdownValue = null;
+                    }, 500);
+                } else {
+                    this.runCountdown();
+                }
+            }, 1000);
+        }
+    }
+
+    update() {
+        if (this.state === 'racing') {
+            // Update cars
+            this.cars.forEach(car => {
+                const lapComplete = car.update(this.keys, this.track);
+                if (lapComplete && car.lap >= this.lapsToWin) {
+                    this.endRound(car);
+                }
+                audio.updateEngine(car.speed, car.maxSpeed);
+            });
+
+            // Check collisions
+            this.car1.checkCollision(this.car2);
+
+        } else if (this.state === 'roundEnd') {
+            this.pauseTimer--;
+            if (this.pauseTimer <= 0) {
+                if (this.round >= this.maxRounds) {
+                    this.endGame();
+                } else {
+                    this.nextRound();
+                }
+            }
+        } else if (this.state === 'gameEnd') {
+            if (this.keys['Space'] || this.keys['Enter']) {
+                this.restart();
+            }
+        }
+    }
+
+    endRound(winner) {
+        this.state = 'roundEnd';
+        this.roundWinner = winner;
+        winner.roundWins++;
+        this.pauseTimer = 180; // 3 seconds at 60fps
+        audio.fanfare();
+    }
+
+    nextRound() {
+        this.round++;
+        this.track = new Track(); // New random track
+        this.startCountdown();
+    }
+
+    endGame() {
+        this.state = 'gameEnd';
+        if (this.car1.roundWins > this.car2.roundWins) {
+            this.gameWinner = this.car1;
+        } else if (this.car2.roundWins > this.car1.roundWins) {
+            this.gameWinner = this.car2;
+        } else {
+            this.gameWinner = 'tie';
+        }
+    }
+
+    restart() {
+        this.round = 1;
+        this.car1.roundWins = 0;
+        this.car2.roundWins = 0;
+        this.track = new Track();
+        this.startCountdown();
+    }
+
+    drawUI() {
+        // Top bar background
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, canvas.width, 60);
+
+        // Round info
+        this.drawText(`ROUND ${this.round}/${this.maxRounds}`, canvas.width/2, 35, 24, '#fff', 'center');
+
+        // P1 Info
+        this.drawText(`P1 LAPS: ${this.car1.lap}/${this.lapsToWin}`, 20, 35, 20, '#e74c3c', 'left');
+        this.drawRoundWins(this.car1.roundWins, 20, 50, '#e74c3c');
+
+        // P2 Info
+        this.drawText(`P2 LAPS: ${this.car2.lap}/${this.lapsToWin}`, canvas.width - 20, 35, 20, '#3498db', 'right');
+        this.drawRoundWins(this.car2.roundWins, canvas.width - 20, 50, '#3498db', true);
+
+        // Controls hint
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(0, canvas.height - 40, canvas.width, 40);
+        this.drawText('P1: ← →    P2: A D', canvas.width/2, canvas.height - 15, 16, '#aaa', 'center');
+
+        // Countdown overlay
+        if (this.countdownValue) {
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const size = this.countdownValue === 'GO' ? 80 : 60;
+            const color = this.countdownValue === 'GO' ? '#2ecc71' : '#fff';
+            this.drawText(this.countdownValue, canvas.width/2, canvas.height/2, size, color, 'center', true);
+        }
+
+        // Round end overlay
+        if (this.state === 'roundEnd') {
+            ctx.fillStyle = 'rgba(0,0,0,0.7)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const color = this.roundWinner.color;
+            this.drawText('ROUND WINNER!', canvas.width/2, canvas.height/2 - 40, 40, '#fff', 'center');
+            this.drawText(this.roundWinner === this.car1 ? 'PLAYER 1' : 'PLAYER 2', canvas.width/2, canvas.height/2 + 20, 60, color, 'center', true);
+        }
+
+        // Game end overlay
+        if (this.state === 'gameEnd') {
+            ctx.fillStyle = 'rgba(0,0,0,0.85)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            this.drawText('RACE COMPLETE', canvas.width/2, 150, 50, '#f1c40f', 'center', true);
+            
+            if (this.gameWinner === 'tie') {
+                this.drawText('IT\'S A TIE!', canvas.width/2, 280, 60, '#fff', 'center');
+            } else {
+                const color = this.gameWinner.color;
+                this.drawText(this.gameWinner === this.car1 ? 'PLAYER 1 WINS!' : 'PLAYER 2 WINS!', canvas.width/2, 280, 60, color, 'center', true);
+            }
+            
+            this.drawText(`P1 Rounds: ${this.car1.roundWins}  |  P2 Rounds: ${this.car2.roundWins}`, canvas.width/2, 380, 24, '#fff', 'center');
+            this.drawText('Press SPACE or ENTER to restart', canvas.width/2, 480, 20, '#aaa', 'center');
+        }
+    }
+
+    drawRoundWins(wins, x, y, color, rightAlign = false) {
+        for (let i = 0; i < 3; i++) {
+            const cx = rightAlign ? x - (i * 20) - 10 : x + (i * 20) + 10;
+            ctx.beginPath();
+            ctx.arc(cx, y, 6, 0, Math.PI * 2);
+            ctx.fillStyle = i < wins ? color : '#444';
+            ctx.fill();
+            ctx.strokeStyle = '#666';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+    }
+
+    drawText(text, x, y, size, color, align = 'left', bold = false) {
+        ctx.font = `${bold ? 'bold ' : ''}${size}px Arial`;
+        ctx.textAlign = align;
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 4;
+        ctx.strokeText(text, x, y);
+        ctx.fillStyle = color;
+        ctx.fillText(text, x, y);
+    }
+
+    draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        this.track.draw(ctx);
+        
+        // Draw cars (sort by Y for pseudo-depth)
+        this.cars.sort((a, b) => a.y - b.y);
+        this.cars.forEach(car => car.draw(ctx));
+
+        this.drawUI();
+    }
+
+    loop() {
+        this.update();
+        this.draw();
+        requestAnimationFrame(() => this.loop());
+    }
+}
+
+// Start game
+window.onload = () => {
+    new Game();
+};
+</script>
+</body>
+</html>
