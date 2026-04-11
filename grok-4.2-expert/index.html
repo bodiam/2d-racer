@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Hotseat Racing • 2-Player Top-Down</title>
+    <style>
+        body {
+            margin: 0;
+            background: #111;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            font-family: system-ui, sans-serif;
+        }
+        canvas {
+            image-rendering: crisp-edges;
+            border: 8px solid #222;
+            box-shadow: 0 0 30px rgba(0, 0, 0, 0.6);
+        }
+    </style>
+</head>
+<body>
+    <canvas id="game" width="800" height="600"></canvas>
+
+    <script>
+        // =============================================
+        // HOTSEAT RACING - Single-file vanilla JS game
+        // 2 players, random track every round, full Web Audio
+        // =============================================
+
+        const canvas = document.getElementById('game');
+        const ctx = canvas.getContext('2d');
+
+        // Game constants
+        const WIDTH = 800;
+        const HEIGHT = 600;
+        const MAX_ROUNDS = 3;
+        const LAPS_PER_ROUND = 3;
+        const ROAD_WIDTH = 72;
+        const CAR_RADIUS = 18;
+        const MAX_SPEED = 5.8;
+
+        // Game state
+        let track = {};
+        let cars = [
+            { id: 1, color: '#e22', x: 0, y: 0, angle: 0, vx: 0, vy: 0, laps: 0, prevX: 0, prevY: 0 },
+            { id: 2, color: '#22e', x: 0, y: 0, angle: 0, vx: 0, vy: 0, laps: 0, prevX: 0, prevY: 0 }
+        ];
+        let keys = {};
+        let gameState = 'countdown'; // countdown | racing | roundOver | gameOver
+        let countdownTimer = 3000;
+        let roundOverTimer = 0;
+        let currentRound = 1;
+        let p1RoundWins = 0;
+        let p2RoundWins = 0;
+        let roundWinner = 0;
+        let lastTime = 0;
+
+        // Audio
+        let audioCtx;
+        let engineOsc = [null, null];
+        let engineGain = [null, null];
+
+        // =============================================
+        // AUDIO - All generated with Web Audio API
+        // =============================================
+        function initAudio() {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+            // Two engine oscillators (sawtooth for classic arcade hum)
+            for (let i = 0; i < 2; i++) {
+                engineOsc[i] = audioCtx.createOscillator();
+                engineOsc[i].type = 'sawtooth';
+                engineGain[i] = audioCtx.createGain();
+                engineGain[i].gain.value = 0;
+                engineOsc[i].connect(engineGain[i]).connect(audioCtx.destination);
+                engineOsc[i].start();
+            }
+        }
+
+        function updateEngineSounds() {
+            for (let i = 0; i < 2; i++) {
+                const speed = Math.hypot(cars[i].vx, cars[i].vy);
+                const pitch = 65 + (speed / MAX_SPEED) * 135;
+                engineOsc[i].frequency.setValueAtTime(pitch, audioCtx.currentTime);
+                engineGain[i].gain.setValueAtTime(0.13 + (speed / MAX_SPEED) * 0.12, audioCtx.currentTime);
+            }
+        }
+
+        function playBeep(freq, duration, volume = 0.35) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+            osc.connect(gain).connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration + 0.1);
+        }
+
+        function playCollisionThud() {
+            if (!audioCtx) return;
+            const bufferSize = Math.floor(audioCtx.sampleRate * 0.25);
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const output = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) output[i] = Math.random() * 2 - 1;
+
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buffer;
+
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.setValueAtTime(900, audioCtx.currentTime);
+
+            const gain = audioCtx.createGain();
+            gain.gain.setValueAtTime(0.9, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.35);
+
+            noise.connect(filter).connect(gain).connect(audioCtx.destination);
+            noise.start();
+        }
+
+        function playLapBeep() {
+            playBeep(720, 0.07);
+            setTimeout(() => playBeep(920, 0.12), 60);
+        }
+
+        function playStartSequence(count) {
+            // 3-2-1-GO! beeps
+            const freq = count === 0 ? 1100 : 420 + count * 130;
+            const dur = count === 0 ? 0.45 : 0.25;
+            playBeep(freq, dur, count === 0 ? 0.6 : 0.4);
+        }
+
+        function playRoundWinFanfare(winner) {
+            let delay = 0;
+            const base = winner === 1 ? 440 : 520;
+            for (let i = 0; i < 6; i++) {
+                setTimeout(() => playBeep(base + i * 90, 0.09), delay);
+                delay += 55;
+            }
+            setTimeout(() => playBeep(base + 520, 0.6), delay + 80);
+        }
+
+        // =============================================
+        // TRACK GENERATION - Random smooth closed loop
+        // =============================================
+        function generateTrack() {
+            const numPoints = 6 + Math.floor(Math.random() * 5); // 6-10
+            const cx = WIDTH / 2;
+            const cy = HEIGHT / 2;
+            const minR = 145;
+            const maxR = 275;
+
+            let points = [];
+            for (let i = 0; i < numPoints; i++) {
+                const angle = (i * Math.PI * 2 / numPoints) + (Math.random() * 0.35 - 0.17);
+                const radius = minR + Math.random() * (maxR - minR);
+                points.push({
+                    x: cx + Math.cos(angle) * radius,
+                    y: cy + Math.sin(angle) * radius
+                });
+            }
+
+            // Sort by angle to guarantee clean loop
+            points.sort((a, b) => {
+                const aa = Math.atan2(a.y - cy, a.x - cx);
+                const ba = Math.atan2(b.y - cy, b.x - cx);
+                return aa - ba;
+            });
+
+            track = {
+                waypoints: points,
+                roadWidth: ROAD_WIDTH,
+                centerLine: [],
+                tangentX: 0,
+                tangentY: 0,
+                startPoint: null,
+                finishX1: 0, finishY1: 0,
+                finishX2: 0, finishY2: 0
+            };
+
+            const tension = 0.42;
+            const n = points.length;
+            const samplesPerSegment = 26;
+
+            // Sample dense center line using Catmull-Rom → cubic Bézier
+            for (let i = 0; i < n; i++) {
+                const p0 = points[(i - 1 + n) % n];
+                const p1 = points[i];
+                const p2 = points[(i + 1) % n];
+                const p3 = points[(i + 2) % n];
+
+                const cp1x = p1.x + (p2.x - p0.x) * tension;
+                const cp1y = p1.y + (p2.y - p0.y) * tension;
+                const cp2x = p2.x - (p3.x - p1.x) * tension;
+                const cp2y = p2.y - (p3.y - p1.y) * tension;
+
+                for (let s = 0; s <= samplesPerSegment; s++) {
+                    const t = s / samplesPerSegment;
+                    const u = 1 - t;
+                    const tt = t * t;
+                    const uu = u * u;
+                    const uuu = uu * u;
+                    const ttt = tt * t;
+
+                    const x = uuu * p1.x + 3 * uu * t * cp1x + 3 * u * tt * cp2x + ttt * p2.x;
+                    const y = uuu * p1.y + 3 * uu * t * cp1y + 3 * u * tt * cp2y + ttt * p2.y;
+                    track.centerLine.push({ x, y });
+                }
+            }
+
+            // Start / finish line data
+            track.startPoint = track.centerLine[0];
+
+            // Tangent at start (using a few samples for stability)
+            const dx = track.centerLine[5].x - track.centerLine[0].x;
+            const dy = track.centerLine[5].y - track.centerLine[0].y;
+            const len = Math.hypot(dx, dy) || 1;
+            track.tangentX = dx / len;
+            track.tangentY = dy / len;
+
+            // Perpendicular vector for finish line
+            const roadHalf = ROAD_WIDTH / 2;
+            const px = -track.tangentY;
+            const py = track.tangentX;
+            track.finishX1 = track.startPoint.x + px * roadHalf;
+            track.finishY1 = track.startPoint.y + py * roadHalf;
+            track.finishX2 = track.startPoint.x - px * roadHalf;
+            track.finishY2 = track.startPoint.y - py * roadHalf;
+        }
+
+        function drawSmoothPath() {
+            const points = track.waypoints;
+            const n = points.length;
+            const tension = 0.42;
+            ctx.beginPath();
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let i = 0; i < n; i++) {
+                const p0 = points[(i - 1 + n) % n];
+                const p1 = points[i];
+                const p2 = points[(i + 1) % n];
+                const p3 = points[(i + 2) % n];
+                const cp1x = p1.x + (p2.x - p0.x) * tension;
+                const cp1y = p1.y + (p2.y - p0.y) * tension;
+                const cp2x = p2.x - (p3.x - p1.x) * tension;
+                const cp2y = p2.y - (p3.y - p1.y) * tension;
+                ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+            }
+        }
+
+        function drawCheckeredFinish() {
+            const bandThickness = 14;
+            const numChecks = 10;
+            const checkLen = ROAD_WIDTH / numChecks;
+            const tx = track.tangentX;
+            const ty = track.tangentY;
+
+            for (let i = 0; i < numChecks; i++) {
+                ctx.fillStyle = (i % 2 === 0) ? '#fff' : '#111';
+                const f1 = i / numChecks;
+                const f2 = (i + 1) / numChecks;
+
+                const x1 = track.finishX1 + (track.finishX2 - track.finishX1) * f1;
+                const y1 = track.finishY1 + (track.finishY2 - track.finishY1) * f1;
+                const x2 = track.finishX1 + (track.finishX2 - track.finishX1) * f2;
+                const y2 = track.finishY1 + (track.finishY2 - track.finishY1) * f2;
+
+                ctx.beginPath();
+                ctx.moveTo(x1 - tx * bandThickness / 2, y1 - ty * bandThickness / 2);
+                ctx.lineTo(x1 + tx * bandThickness / 2, y1 + ty * bandThickness / 2);
+                ctx.lineTo(x2 + tx * bandThickness / 2, y2 + ty * bandThickness / 2);
+                ctx.lineTo(x2 - tx * bandThickness / 2, y2 - ty * bandThickness / 2);
+                ctx.closePath();
+                ctx.fill();
+            }
+        }
+
+        function drawTrack() {
+            // Grass background
+            ctx.fillStyle = '#0a4c1f';
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+            // Asphalt road
+            ctx.strokeStyle = '#1c1c1c';
+            ctx.lineWidth = track.roadWidth;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            drawSmoothPath();
+            ctx.stroke();
+
+            // White lane markings (dashed center line)
+            ctx.strokeStyle = '#f4f4f4';
+            ctx.lineWidth = 5;
+            ctx.setLineDash([32, 24]);
+            drawSmoothPath();
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Checkered start/finish line
+            drawCheckeredFinish();
+        }
+
+        // =============================================
+        // CAR PHYSICS & COLLISIONS
+        // =============================================
+        function findClosestPoint(x, y) {
+            let minDist = Infinity;
+            let closest = { x: 0, y: 0 };
+            for (let p of track.centerLine) {
+                const d = Math.hypot(p.x - x, p.y - y);
+                if (d < minDist) {
+                    minDist = d;
+                    closest = p;
+                }
+            }
+            return { point: closest, dist: minDist };
+        }
+
+        function updateCar(car, steer) {
+            car.prevX = car.x;
+            car.prevY = car.y;
+
+            // Turning rate proportional to speed (as requested)
+            const speed = Math.hypot(car.vx, car.vy);
+            const turnRate = 0.048 * (speed / MAX_SPEED + 0.25);
+            car.angle += steer * turnRate;
+
+            const fx = Math.cos(car.angle);
+            const fy = Math.sin(car.angle);
+
+            // Auto-accelerate forward
+            const accel = 0.38;
+            car.vx += fx * accel;
+            car.vy += fy * accel;
+
+            // Base drag
+            let drag = 0.962;
+
+            // Off-road detection + push-back + slowdown
+            const info = findClosestPoint(car.x, car.y);
+            const roadHalf = track.roadWidth / 2;
+            const offRoad = info.dist > roadHalf + 4;
+
+            if (offRoad) drag = 0.84;
+
+            car.vx *= drag;
+            car.vy *= drag;
+
+            // Cap speed
+            const curSpeed = Math.hypot(car.vx, car.vy);
+            if (curSpeed > MAX_SPEED) {
+                const ratio = MAX_SPEED / curSpeed;
+                car.vx *= ratio;
+                car.vy *= ratio;
+            }
+
+            // Move
+            car.x += car.vx;
+            car.y += car.vy;
+
+            // Strong push back if off-road + extra slowdown
+            if (offRoad) {
+                const dx = info.point.x - car.x;
+                const dy = info.point.y - car.y;
+                const d = info.dist || 1;
+                const push = (d - roadHalf) * 0.85;
+                car.x += (dx / d) * push;
+                car.y += (dy / d) * push;
+                car.vx *= 0.78;
+                car.vy *= 0.78;
+            }
+        }
+
+        function checkCarCollision() {
+            const c1 = cars[0];
+            const c2 = cars[1];
+            const dx = c2.x - c1.x;
+            const dy = c2.y - c1.y;
+            const dist = Math.hypot(dx, dy);
+
+            if (dist < CAR_RADIUS * 2 && dist > 0.1) {
+                const nx = dx / dist;
+                const ny = dy / dist;
+                const overlap = CAR_RADIUS * 2 - dist;
+
+                // Separate cars
+                c1.x -= nx * overlap * 0.5;
+                c1.y -= ny * overlap * 0.5;
+                c2.x += nx * overlap * 0.5;
+                c2.y += ny * overlap * 0.5;
+
+                // Elastic bounce (equal mass)
+                const v1n = c1.vx * nx + c1.vy * ny;
+                const v2n = c2.vx * nx + c2.vy * ny;
+                const restitution = 0.75;
+                const impulse = -(1 + restitution) * (v1n - v2n) / 2;
+
+                c1.vx += impulse * nx;
+                c1.vy += impulse * ny;
+                c2.vx -= impulse * nx;
+                c2.vy -= impulse * ny;
+
+                playCollisionThud();
+            }
+        }
+
+        function checkLap(car) {
+            // Line-segment intersection test for finish line
+            function ccw(ax, ay, bx, by, cx, cy) {
+                return (cy - ay) * (bx - ax) > (by - ay) * (cx - ax);
+            }
+            const intersect = ccw(car.prevX, car.prevY, car.x, car.y, track.finishX1, track.finishY1, track.finishX2, track.finishY2) !==
+                              ccw(car.prevX, car.prevY, car.x, car.y, track.finishX2, track.finishY2, track.finishX1, track.finishY1) &&
+                              ccw(track.finishX1, track.finishY1, track.finishX2, track.finishY2, car.prevX, car.prevY, car.x, car.y) !==
+                              ccw(track.finishX1, track.finishY1, track.finishX2, track.finishY2, car.x, car.y, car.prevX, car.prevY);
+
+            if (intersect) {
+                const velX = car.vx;
+                const velY = car.vy;
+                const dot = velX * track.tangentX + velY * track.tangentY;
+                if (dot > 1) { // forward direction
+                    car.laps++;
+                    playLapBeep();
+                }
+            }
+        }
+
+        // =============================================
+        // RESET & GAME FLOW
+        // =============================================
+        function resetCars() {
+            const start = track.startPoint;
+            const tx = track.tangentX;
+            const ty = track.tangentY;
+            const px = -track.tangentY;
+            const py = track.tangentX;
+            const offset = ROAD_WIDTH / 3.5;
+
+            cars[0].x = start.x + px * offset;
+            cars[0].y = start.y + py * offset;
+            cars[0].angle = Math.atan2(ty, tx);
+            cars[0].vx = cars[0].vy = 0;
+            cars[0].laps = 0;
+
+            cars[1].x = start.x - px * offset;
+            cars[1].y = start.y - py * offset;
+            cars[1].angle = Math.atan2(ty, tx);
+            cars[1].vx = cars[1].vy = 0;
+            cars[1].laps = 0;
+        }
+
+        function resetGame() {
+            currentRound = 1;
+            p1RoundWins = 0;
+            p2RoundWins = 0;
+            generateTrack();
+            resetCars();
+            gameState = 'countdown';
+            countdownTimer = 3000;
+        }
+
+        // =============================================
+        // MAIN UPDATE LOOP
+        // =============================================
+        function update(delta) {
+            if (gameState === 'countdown') {
+                countdownTimer -= delta;
+
+                // Trigger start beeps
+                const count = Math.ceil(countdownTimer / 1000);
+                if (count >= 0 && count <= 3) {
+                    // Simple debounce via a static lastCount variable (declared outside)
+                    if (typeof window.lastCountdown !== 'number' || window.lastCountdown !== count) {
+                        window.lastCountdown = count;
+                        playStartSequence(count);
+                    }
+                }
+                if (countdownTimer <= 0) {
+                    gameState = 'racing';
+                    window.lastCountdown = -1;
+                }
+            }
+
+            else if (gameState === 'racing') {
+                // Input
+                const p1Steer = (keys['ArrowLeft'] ? -1 : 0) + (keys['ArrowRight'] ? 1 : 0);
+                const p2Steer = ((keys['a'] || keys['A']) ? -1 : 0) + ((keys['d'] || keys['D']) ? 1 : 0);
+
+                updateCar(cars[0], p1Steer);
+                updateCar(cars[1], p2Steer);
+                checkCarCollision();
+
+                checkLap(cars[0]);
+                checkLap(cars[1]);
+
+                updateEngineSounds();
+
+                // Round end?
+                if (cars[0].laps >= LAPS_PER_ROUND || cars[1].laps >= LAPS_PER_ROUND) {
+                    roundWinner = cars[0].laps >= LAPS_PER_ROUND ? 1 : 2;
+                    if (cars[0].laps >= LAPS_PER_ROUND && cars[1].laps >= LAPS_PER_ROUND) roundWinner = 1; // rare tiebreaker
+                    if (roundWinner === 1) p1RoundWins++;
+                    else p2RoundWins++;
+                    gameState = 'roundOver';
+                    roundOverTimer = 1650;
+                    playRoundWinFanfare(roundWinner);
+                }
+            }
+
+            else if (gameState === 'roundOver') {
+                roundOverTimer -= delta;
+                if (roundOverTimer <= 0) {
+                    if (currentRound < MAX_ROUNDS) {
+                        currentRound++;
+                        generateTrack();           // new random track
+                        resetCars();
+                        gameState = 'countdown';
+                        countdownTimer = 3000;
+                    } else {
+                        gameState = 'gameOver';
+                    }
+                }
+            }
+
+            else if (gameState === 'gameOver') {
+                // Handled in key handler for restart
+            }
+        }
+
+        // =============================================
+        // RENDERING
+        // =============================================
+        function drawCar(car) {
+            ctx.save();
+            ctx.translate(car.x, car.y);
+            ctx.rotate(car.angle);
+
+            // Main body
+            ctx.fillStyle = car.color;
+            ctx.fillRect(-12, -19, 24, 38);
+
+            // Cabin / roof
+            ctx.fillStyle = '#111';
+            ctx.fillRect(-8.5, -13, 17, 19);
+
+            // Wheels
+            ctx.fillStyle = '#111';
+            ctx.fillRect(-15, -16, 6, 9);   // rear left
+            ctx.fillRect(9, -16, 6, 9);     // rear right
+            ctx.fillRect(-15, 7, 6, 9);     // front left
+            ctx.fillRect(9, 7, 6, 9);       // front right
+
+            ctx.restore();
+        }
+
+        function drawUI() {
+            ctx.save();
+
+            // Top bar background (semi-transparent)
+            ctx.fillStyle = 'rgba(0,0,0,0.4)';
+            ctx.fillRect(0, 0, WIDTH, 88);
+
+            // Laps
+            ctx.font = '700 26px system-ui';
+            ctx.textBaseline = 'middle';
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 4;
+
+            // P1
+            ctx.fillStyle = '#e22';
+            ctx.textAlign = 'left';
+            ctx.strokeText(`P1  ${cars[0].laps}/${LAPS_PER_ROUND}`, 28, 38);
+            ctx.fillText(`P1  ${cars[0].laps}/${LAPS_PER_ROUND}`, 28, 38);
+
+            // P2
+            ctx.fillStyle = '#22e';
+            ctx.textAlign = 'right';
+            ctx.strokeText(`P2  ${cars[1].laps}/${LAPS_PER_ROUND}`, WIDTH - 28, 38);
+            ctx.fillText(`P2  ${cars[1].laps}/${LAPS_PER_ROUND}`, WIDTH - 28, 38);
+
+            // Round indicator
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = 'center';
+            ctx.strokeText(`ROUND ${currentRound}/${MAX_ROUNDS}`, WIDTH / 2, 38);
+            ctx.fillText(`ROUND ${currentRound}/${MAX_ROUNDS}`, WIDTH / 2, 38);
+
+            // Round wins as colored dots
+            const dotY = 72;
+            ctx.lineWidth = 3;
+            // P1 dots
+            for (let i = 0; i < MAX_ROUNDS; i++) {
+                ctx.fillStyle = i < p1RoundWins ? '#e22' : '#444';
+                ctx.beginPath();
+                ctx.arc(155 + i * 34, dotY, 9, 0, Math.PI * 2);
+                ctx.fill();
+                if (i >= p1RoundWins) {
+                    ctx.strokeStyle = '#e22';
+                    ctx.stroke();
+                }
+            }
+            // P2 dots
+            for (let i = 0; i < MAX_ROUNDS; i++) {
+                ctx.fillStyle = i < p2RoundWins ? '#22e' : '#444';
+                ctx.beginPath();
+                ctx.arc(WIDTH - 155 - i * 34, dotY, 9, 0, Math.PI * 2);
+                ctx.fill();
+                if (i >= p2RoundWins) {
+                    ctx.strokeStyle = '#22e';
+                    ctx.stroke();
+                }
+            }
+
+            // Bottom controls hint
+            ctx.font = '500 17px system-ui';
+            ctx.fillStyle = '#ddd';
+            ctx.textAlign = 'center';
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 2.5;
+            ctx.strokeText('← →   PLAYER 1          PLAYER 2   A D', WIDTH / 2, HEIGHT - 24);
+            ctx.fillText('← →   PLAYER 1          PLAYER 2   A D', WIDTH / 2, HEIGHT - 24);
+
+            ctx.restore();
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, WIDTH, HEIGHT);
+            drawTrack();
+
+            // Cars
+            drawCar(cars[0]);
+            drawCar(cars[1]);
+
+            drawUI();
+
+            // State overlays
+            if (gameState === 'countdown') {
+                const count = Math.max(0, Math.ceil(countdownTimer / 1000));
+                const text = count > 0 ? count.toString() : 'GO!';
+                ctx.save();
+                ctx.shadowColor = '#ff0';
+                ctx.shadowBlur = 25;
+                ctx.font = '900 92px system-ui';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.strokeStyle = '#000';
+                ctx.lineWidth = 12;
+                ctx.strokeText(text, WIDTH / 2, HEIGHT / 2);
+                ctx.fillStyle = count > 0 ? '#ff0' : '#0f0';
+                ctx.fillText(text, WIDTH / 2, HEIGHT / 2);
+                ctx.restore();
+            }
+
+            if (gameState === 'roundOver') {
+                const text = `PLAYER ${roundWinner} WINS ROUND ${currentRound}`;
+                ctx.save();
+                ctx.font = '700 52px system-ui';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.strokeStyle = '#000';
+                ctx.lineWidth = 9;
+                ctx.strokeText(text, WIDTH / 2, HEIGHT / 2 - 20);
+                ctx.fillStyle = roundWinner === 1 ? '#e22' : '#22e';
+                ctx.fillText(text, WIDTH / 2, HEIGHT / 2 - 20);
+                ctx.restore();
+            }
+
+            if (gameState === 'gameOver') {
+                const champ = p1RoundWins > p2RoundWins ? 1 : 2;
+                ctx.save();
+                ctx.shadowBlur = 30;
+                ctx.shadowColor = '#ff0';
+                ctx.font = '900 62px system-ui';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.strokeStyle = '#000';
+                ctx.lineWidth = 10;
+                ctx.strokeText(`PLAYER ${champ} CHAMPION!`, WIDTH / 2, HEIGHT / 2 - 55);
+                ctx.fillStyle = champ === 1 ? '#e22' : '#22e';
+                ctx.fillText(`PLAYER ${champ} CHAMPION!`, WIDTH / 2, HEIGHT / 2 - 55);
+
+                ctx.font = '700 36px system-ui';
+                ctx.fillStyle = '#fff';
+                ctx.shadowBlur = 0;
+                ctx.strokeText(`P1: ${p1RoundWins}   P2: ${p2RoundWins}`, WIDTH / 2, HEIGHT / 2 + 12);
+                ctx.fillText(`P1: ${p1RoundWins}   P2: ${p2RoundWins}`, WIDTH / 2, HEIGHT / 2 + 12);
+
+                ctx.font = '500 26px system-ui';
+                ctx.fillStyle = '#ff0';
+                ctx.fillText('PRESS R TO RACE AGAIN', WIDTH / 2, HEIGHT / 2 + 88);
+                ctx.restore();
+            }
+        }
+
+        // =============================================
+        // GAME LOOP
+        // =============================================
+        function gameLoop(ts) {
+            if (!lastTime) lastTime = ts;
+            const delta = ts - lastTime;
+            lastTime = ts;
+
+            update(delta);
+            draw();
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        // =============================================
+        // START THE GAME
+        // =============================================
+        function start() {
+            initAudio();
+            generateTrack();
+            resetCars();
+
+            window.addEventListener('keydown', e => {
+                keys[e.key] = true;
+
+                // Resume audio on first user gesture (required by browsers)
+                if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+
+                // Restart from game over
+                if (gameState === 'gameOver' && (e.key === 'r' || e.key === 'R')) {
+                    resetGame();
+                }
+            });
+
+            window.addEventListener('keyup', e => {
+                keys[e.key] = false;
+            });
+
+            requestAnimationFrame(gameLoop);
+            console.log('%cHotseat Racing ready! Arrow keys + A/D', 'font-family:monospace;color:#0f0');
+        }
+
+        // Launch
+        window.onload = start;
+    </script>
+</body>
+</html>
