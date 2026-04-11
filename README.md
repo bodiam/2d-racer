@@ -25,6 +25,7 @@ Each directory contains one model's single-file attempt. Open the HTML file dire
 | Claude Opus 4.5    | [`opus-4.5/index.html`](./opus-4.5/index.html)             |
 | Gemini 3.1 Pro     | [`gemini-3.1-pro/index.html`](./gemini-3.1-pro/index.html) |
 | Gemini 3 Fast      | [`gemini-3-fast/index.html`](./gemini-3-fast/index.html)   |
+| Gemma 4 31B IT     | [`gemma-4-31b-it/index.html`](./gemma-4-31b-it/index.html) |
 | Grok 4.2 Expert    | [`grok-4.2-expert/index.html`](./grok-4.2-expert/index.html) |
 | GLM 5.1            | [`glm-5.1/index.html`](./glm-5.1/index.html)               |
 | Kimi K2 Thinking   | [`kimi-k2-thinking/index.html`](./kimi-k2-thinking/index.html) |
