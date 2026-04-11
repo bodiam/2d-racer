@@ -27,6 +27,7 @@ Each directory contains one model's single-file attempt. Open the HTML file dire
 | Gemini 3 Fast      | [`gemini-3-fast/index.html`](./gemini-3-fast/index.html)   |
 | Grok 4.2 Expert    | [`grok-4.2-expert/index.html`](./grok-4.2-expert/index.html) |
 | GLM 5.1            | [`glm-5.1/index.html`](./glm-5.1/index.html)               |
+| Kimi K2 Thinking   | [`kimi-k2-thinking/index.html`](./kimi-k2-thinking/index.html) |
 | MiniMax 2.5        | [`minimax-2.5/racing.html`](./minimax-2.5/racing.html)     |
 
 MiniMax 2.5 also produced a [`SPEC.md`](./minimax-2.5/SPEC.md) alongside its implementation.
