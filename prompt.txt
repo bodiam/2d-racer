@@ -1,0 +1,15 @@
+Prompt:
+
+Build a complete single-file HTML/JS 2D top-down racing game for 2 players hotseat. No canvas libraries — use a <canvas> element with vanilla JS.
+
+Track: Randomly generated per race. Draw a closed looping circuit on a single non-scrolling screen (800×600). Generate it by placing 6–10 random waypoints around a center point, sorting them by angle, and building a smooth path through them. The track has a visible road surface (dark asphalt), white lane markings, grass/dirt outside, and a visible start/finish line with a checkered pattern. Place the track entirely within the canvas. Regenerate the track between races.
+
+Cars: Two cars, one red (Player 1) and one blue (Player 2). Cars auto-accelerate forward at a constant speed — no throttle input needed. Players steer only: Player 1 uses Left/Right arrow keys, Player 2 uses A/D. Cars have arcade physics: turning rate proportional to speed, slight drift/inertia. Collision between cars: detect overlap and apply a bounce/push impulse so cars can bump into each other. Cars stay within the track boundaries (push back if off-road, also slow down on grass).
+
+Race structure: A race = 3 laps per round, 3 rounds total. Display current lap, round, and each player's round wins prominently. When a car crosses the start/finish line in the correct direction, increment its lap count. First car to complete 3 laps wins the round. After 3 rounds, show a winner screen with total round wins. Show a countdown (3-2-1-GO!) before each round starts. After each round, pause briefly and show who won it, then auto-continue to next round or end screen.
+
+Sound: Generate all sounds with the Web Audio API (no external files). Include: engine hum (looping oscillator, pitch varies with speed), collision thud (noise burst), lap complete beep, round win fanfare, race start beep sequence (3-2-1-GO).
+
+UI overlay (on canvas): Top bar showing P1 laps / P2 laps, current round (e.g. "Round 2/3"), each player's round wins as colored dots or icons. Show player controls in small text at bottom (← → and A D). All text white with dark outline for readability.
+
+Code requirements: Everything in one HTML file. No external dependencies. Clean, well-structured JS with clear section comments. Must work in a modern browser with no build step.

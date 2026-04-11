@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2D Top-Down Racer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+  canvas { border: 2px solid #333; }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="600"></canvas>
+<script>
+// ============================================================
+// CONSTANTS
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 800, H = 600;
+const TRACK_WIDTH = 70;
+const TOTAL_LAPS = 3;
+const TOTAL_ROUNDS = 3;
+const CAR_LENGTH = 20;
+const CAR_WIDTH = 12;
+const BASE_SPEED = 3.2;
+const GRASS_SPEED = 1.2;
+const TURN_RATE = 0.04;
+const BOUNCE_FORCE = 2.5;
+
+// ============================================================
+// AUDIO ENGINE (Web Audio API)
+// ============================================================
+let audioCtx = null;
+let engineOsc1 = null, engineOsc2 = null, engineGain1 = null, engineGain2 = null;
+
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function startEngineSound() {
+  if (!audioCtx || engineOsc1) return;
+  engineOsc1 = audioCtx.createOscillator();
+  engineOsc1.type = 'sawtooth';
+  engineOsc1.frequency.value = 80;
+  engineGain1 = audioCtx.createGain();
+  engineGain1.gain.value = 0.06;
+  engineOsc1.connect(engineGain1).connect(audioCtx.destination);
+  engineOsc1.start();
+
+  engineOsc2 = audioCtx.createOscillator();
+  engineOsc2.type = 'sawtooth';
+  engineOsc2.frequency.value = 80;
+  engineGain2 = audioCtx.createGain();
+  engineGain2.gain.value = 0.06;
+  engineOsc2.connect(engineGain2).connect(audioCtx.destination);
+  engineOsc2.start();
+}
+
+function stopEngineSound() {
+  if (engineOsc1) { engineOsc1.stop(); engineOsc1 = null; }
+  if (engineOsc2) { engineOsc2.stop(); engineOsc2 = null; }
+  engineGain1 = null;
+  engineGain2 = null;
+}
+
+function updateEnginePitch(playerIdx, speedFactor) {
+  const osc = playerIdx === 0 ? engineOsc1 : engineOsc2;
+  if (!osc) return;
+  osc.frequency.value = 60 + speedFactor * 120;
+}
+
+function playCollisionSound() {
+  if (!audioCtx) return;
+  const bufferSize = audioCtx.sampleRate * 0.1;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+  }
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.15;
+  source.connect(gain).connect(audioCtx.destination);
+  source.start();
+}
+
+function playLapBeep() {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = 880;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.15;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.3);
+}
+
+function playCountdownBeep(high) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = high ? 1200 : 600;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.2;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.25);
+}
+
+function playWinFanfare() {
+  if (!audioCtx) return;
+  const notes = [523, 659, 784, 1047];
+  notes.forEach((freq, i) => {
+    const osc = audioCtx.createOscillator();
+    osc.type = 'square';
+    osc.frequency.value = freq;
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.0;
+    gain.gain.setValueAtTime(0.0, audioCtx.currentTime + i * 0.15);
+    gain.gain.linearRampToValueAtTime(0.1, audioCtx.currentTime + i * 0.15 + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + i * 0.15 + 0.3);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(audioCtx.currentTime + i * 0.15);
+    osc.stop(audioCtx.currentTime + i * 0.15 + 0.35);
+  });
+}
+
+// ============================================================
+// TRACK GENERATION
+// ============================================================
+let trackCenterLine = [];
+let startLine = null;
+let startLineDir = 0;
+
+function generateTrack() {
+  trackCenterLine = [];
+  const cx = W / 2, cy = H / 2;
+  const numPoints = 6 + Math.floor(Math.random() * 5);
+  const minR = 130, maxR = 220;
+  const points = [];
+
+  for (let i = 0; i < numPoints; i++) {
+    const angle = (Math.PI * 2 * i) / numPoints + (Math.random() - 0.5) * 0.4;
+    const r = minR + Math.random() * (maxR - minR);
+    points.push({
+      x: cx + Math.cos(angle) * r,
+      y: cy + Math.sin(angle) * r
+    });
+  }
+
+  points.sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+
+  for (let i = 0; i < points.length; i++) {
+    const p0 = points[(i - 1 + points.length) % points.length];
+    const p1 = points[i];
+    const p2 = points[(i + 1) % points.length];
+    const p3 = points[(i + 2) % points.length];
+
+    for (let t = 0; t < 1; t += 0.05) {
+      const tt = t * t, ttt = tt * t;
+      const x = 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t +
+        (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * tt +
+        (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * ttt);
+      const y = 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t +
+        (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * tt +
+        (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * ttt);
+      trackCenterLine.push({ x, y });
+    }
+  }
+
+  // Compute start/finish line from first segment
+  const p0 = trackCenterLine[0];
+  const p1 = trackCenterLine[1];
+  const dx = p1.x - p0.x, dy = p1.y - p0.y;
+  startLineDir = Math.atan2(dy, dx);
+  const nx = -Math.sin(startLineDir), ny = Math.cos(startLineDir);
+  startLine = {
+    x1: p0.x + nx * TRACK_WIDTH / 2,
+    y1: p0.y + ny * TRACK_WIDTH / 2,
+    x2: p0.x - nx * TRACK_WIDTH / 2,
+    y2: p0.y - ny * TRACK_WIDTH / 2,
+    cx: p0.x,
+    cy: p0.y
+  };
+}
+
+// ============================================================
+// TRACK QUERIES
+// ============================================================
+function closestTrackPoint(px, py) {
+  let minDist = Infinity, closest = null, closestIdx = 0;
+  for (let i = 0; i < trackCenterLine.length; i++) {
+    const p = trackCenterLine[i];
+    const d = (px - p.x) ** 2 + (py - p.y) ** 2;
+    if (d < minDist) { minDist = d; closest = p; closestIdx = i; }
+  }
+  return { point: closest, dist: Math.sqrt(minDist), index: closestIdx };
+}
+
+function isOnTrack(px, py) {
+  return closestTrackPoint(px, py).dist < TRACK_WIDTH / 2;
+}
+
+function getTrackNormal(idx) {
+  const n = trackCenterLine.length;
+  const prev = trackCenterLine[(idx - 3 + n) % n];
+  const next = trackCenterLine[(idx + 3) % n];
+  const dx = next.x - prev.x, dy = next.y - prev.y;
+  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+  return { x: -dy / len, y: dx / len };
+}
+
+// ============================================================
+// CAR
+// ============================================================
+function createCar(color, startOffset) {
+  const idx = 0;
+  const p = trackCenterLine[idx];
+  const dx = trackCenterLine[1].x - trackCenterLine[0].x;
+  const dy = trackCenterLine[1].y - trackCenterLine[0].y;
+  const angle = Math.atan2(dy, dx);
+  const nx = -Math.sin(angle) * startOffset;
+  const ny = Math.cos(angle) * startOffset;
+  return {
+    x: p.x + nx,
+    y: p.y + ny,
+    angle: angle,
+    vx: 0, vy: 0,
+    color: color,
+    lap: 0,
+    prevTrackIdx: 0,
+    passedHalf: false,
+    speed: 0,
+    finished: false
+  };
+}
+
+function updateCar(car, steerInput) {
+  if (car.finished) return;
+
+  const onTrack = isOnTrack(car.x, car.y);
+  const targetSpeed = onTrack ? BASE_SPEED : GRASS_SPEED;
+  car.speed += (targetSpeed - car.speed) * 0.08;
+
+  car.angle += steerInput * TURN_RATE * (car.speed / BASE_SPEED);
+
+  const moveX = Math.cos(car.angle) * car.speed;
+  const moveY = Math.sin(car.angle) * car.speed;
+
+  car.vx = car.vx * 0.7 + moveX * 0.3;
+  car.vy = car.vy * 0.7 + moveY * 0.3;
+
+  car.x += car.vx;
+  car.y += car.vy;
+
+  // Keep on screen
+  car.x = Math.max(10, Math.min(W - 10, car.x));
+  car.y = Math.max(10, Math.min(H - 10, car.y));
+
+  // Push back onto track if off
+  if (!onTrack) {
+    const { point, dist } = closestTrackPoint(car.x, car.y);
+    if (dist > TRACK_WIDTH / 2) {
+      const pushStr = 0.15;
+      car.x += (point.x - car.x) * pushStr;
+      car.y += (point.y - car.y) * pushStr;
+    }
+  }
+
+  updateEnginePitch(car === cars[0] ? 0 : 1, car.speed / BASE_SPEED);
+}
+
+function getCorners(car) {
+  const cos = Math.cos(car.angle), sin = Math.sin(car.angle);
+  const hw = CAR_WIDTH / 2, hl = CAR_LENGTH / 2;
+  return [
+    { x: car.x + cos * hl - sin * hw, y: car.y + sin * hl + cos * hw },
+    { x: car.x + cos * hl + sin * hw, y: car.y + sin * hl - cos * hw },
+    { x: car.x - cos * hl + sin * hw, y: car.y - sin * hl - cos * hw },
+    { x: car.x - cos * hl - sin * hw, y: car.y - sin * hl + cos * hw }
+  ];
+}
+
+// ============================================================
+// COLLISION
+// ============================================================
+function carsOverlap(c1, c2) {
+  const dx = c1.x - c2.x, dy = c1.y - c2.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  return dist < (CAR_LENGTH + CAR_WIDTH) / 2;
+}
+
+function resolveCollision(c1, c2) {
+  const dx = c1.x - c2.x, dy = c1.y - c2.y;
+  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+  const nx = dx / dist, ny = dy / dist;
+  const overlap = (CAR_LENGTH + CAR_WIDTH) / 2 - dist;
+  if (overlap > 0) {
+    c1.x += nx * overlap * 0.5;
+    c1.y += ny * overlap * 0.5;
+    c2.x -= nx * overlap * 0.5;
+    c2.y -= ny * overlap * 0.5;
+    c1.vx += nx * BOUNCE_FORCE;
+    c1.vy += ny * BOUNCE_FORCE;
+    c2.vx -= nx * BOUNCE_FORCE;
+    c2.vy -= ny * BOUNCE_FORCE;
+    playCollisionSound();
+  }
+}
+
+// ============================================================
+// LAP DETECTION
+// ============================================================
+function lineCross(ax, ay, bx, by, cx, cy, dx2, dy2) {
+  const denom = (bx - ax) * (dy2 - cy) - (by - ay) * (dx2 - cx);
+  if (Math.abs(denom) < 0.0001) return false;
+  const t = ((cx - ax) * (dy2 - cy) - (cy - ay) * (dx2 - cx)) / denom;
+  const u = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / denom;
+  return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+}
+
+function checkLapCross(car) {
+  if (!startLine || car.finished) return;
+  const prevX = car.x - car.vx, prevY = car.y - car.vy;
+
+  const crossed = lineCross(
+    prevX, prevY, car.x, car.y,
+    startLine.x1, startLine.y1, startLine.x2, startLine.y2
+  );
+
+  const ct = closestTrackPoint(car.x, car.y);
+  const halfLen = trackCenterLine.length / 2;
+
+  if (ct.index > halfLen) car.passedHalf = true;
+
+  const dx = car.vx, dy = car.vy;
+  const sdx = startLine.x2 - startLine.x1, sdy = startLine.y2 - startLine.y1;
+  const dot = dx * sdx + dy * sdy;
+
+  if (crossed && car.passedHalf && dot !== 0) {
+    const crossDir = dx * Math.cos(startLineDir) + dy * Math.sin(startLineDir);
+    if (crossDir > 0) {
+      car.lap++;
+      car.passedHalf = false;
+      if (car.lap >= TOTAL_LAPS) {
+        car.finished = true;
+      } else {
+        playLapBeep();
+      }
+    }
+  }
+}
+
+// ============================================================
+// GAME STATE
+// ============================================================
+let cars = [];
+let gameState = 'title'; // title, countdown, racing, roundEnd, gameEnd
+let currentRound = 0;
+let p1Wins = 0, p2Wins = 0;
+let countdownValue = 3;
+let countdownTimer = 0;
+let roundEndTimer = 0;
+let roundWinner = -1;
+let keys = {};
+let gameTime = 0;
+
+function startNewGame() {
+  currentRound = 0;
+  p1Wins = 0;
+  p2Wins = 0;
+  startNewRound();
+}
+
+function startNewRound() {
+  currentRound++;
+  generateTrack();
+  cars = [
+    createCar('#e33', -12),
+    createCar('#33e', 12)
+  ];
+  cars[1].x -= Math.cos(cars[1].angle) * 30;
+  cars[1].y -= Math.sin(cars[1].angle) * 30;
+  gameState = 'countdown';
+  countdownValue = 3;
+  countdownTimer = 0;
+  roundWinner = -1;
+  stopEngineSound();
+}
+
+// ============================================================
+// INPUT
+// ============================================================
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (gameState === 'title' || gameState === 'gameEnd') {
+    initAudio();
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    startNewGame();
+  }
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+// ============================================================
+// UPDATE
+// ============================================================
+function update() {
+  gameTime += 1 / 60;
+
+  if (gameState === 'countdown') {
+    countdownTimer += 1 / 60;
+    const newVal = 3 - Math.floor(countdownTimer);
+    if (newVal !== countdownValue && newVal >= 1) {
+      playCountdownBeep(false);
+    }
+    if (countdownTimer >= 3 && countdownValue !== 0) {
+      playCountdownBeep(true);
+      countdownValue = 0;
+    }
+    if (countdownTimer >= 3.5) {
+      gameState = 'racing';
+      initAudio();
+      startEngineSound();
+    }
+    countdownValue = Math.max(0, newVal);
+    return;
+  }
+
+  if (gameState === 'roundEnd') {
+    roundEndTimer += 1 / 60;
+    if (roundEndTimer > 2.5) {
+      if (currentRound >= TOTAL_ROUNDS) {
+        gameState = 'gameEnd';
+        stopEngineSound();
+      } else {
+        startNewRound();
+      }
+    }
+    return;
+  }
+
+  if (gameState === 'racing') {
+    const steer1 = (keys['ArrowLeft'] ? -1 : 0) + (keys['ArrowRight'] ? 1 : 0);
+    const steer2 = (keys['a'] || keys['A'] ? -1 : 0) + (keys['d'] || keys['D'] ? 1 : 0);
+
+    updateCar(cars[0], steer1);
+    updateCar(cars[1], steer2);
+
+    if (carsOverlap(cars[0], cars[1])) {
+      resolveCollision(cars[0], cars[1]);
+    }
+
+    checkLapCross(cars[0]);
+    checkLapCross(cars[1]);
+
+    // Check round end
+    if (cars[0].finished && roundWinner === -1) {
+      roundWinner = 0;
+      p1Wins++;
+      gameState = 'roundEnd';
+      roundEndTimer = 0;
+      stopEngineSound();
+      playWinFanfare();
+    } else if (cars[1].finished && roundWinner === -1) {
+      roundWinner = 1;
+      p2Wins++;
+      gameState = 'roundEnd';
+      roundEndTimer = 0;
+      stopEngineSound();
+      playWinFanfare();
+    }
+  }
+}
+
+// ============================================================
+// DRAWING
+// ============================================================
+function drawOutlinedText(text, x, y, size, align, color) {
+  ctx.font = `bold ${size}px Arial`;
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = size / 5;
+  ctx.lineJoin = 'round';
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = color || '#fff';
+  ctx.fillText(text, x, y);
+}
+
+function drawTrack() {
+  // Grass background
+  ctx.fillStyle = '#3a7d32';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grass texture dots
+  ctx.fillStyle = '#2e6e28';
+  for (let i = 0; i < 300; i++) {
+    const gx = (i * 137.5) % W, gy = (i * 97.3) % H;
+    ctx.fillRect(gx, gy, 3, 3);
+  }
+
+  // Draw asphalt road
+  if (trackCenterLine.length < 2) return;
+
+  ctx.lineWidth = TRACK_WIDTH;
+  ctx.strokeStyle = '#444';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(trackCenterLine[0].x, trackCenterLine[0].y);
+  for (let i = 1; i < trackCenterLine.length; i++) {
+    ctx.lineTo(trackCenterLine[i].x, trackCenterLine[i].y);
+  }
+  ctx.closePath();
+  ctx.stroke();
+
+  // Track edge lines (white borders)
+  const n = trackCenterLine.length;
+  for (let side = -1; side <= 1; side += 2) {
+    ctx.beginPath();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    for (let i = 0; i <= n; i++) {
+      const idx = i % n;
+      const idx2 = (i + 1) % n;
+      const dx = trackCenterLine[idx2].x - trackCenterLine[idx].x;
+      const dy = trackCenterLine[idx2].y - trackCenterLine[idx].y;
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      const nx = (-dy / len) * (TRACK_WIDTH / 2 - 2) * side;
+      const ny = (dx / len) * (TRACK_WIDTH / 2 - 2) * side;
+      const px = trackCenterLine[idx].x + nx;
+      const py = trackCenterLine[idx].y + ny;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+
+  // Center lane dashes
+  ctx.setLineDash([15, 20]);
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(trackCenterLine[0].x, trackCenterLine[0].y);
+  for (let i = 1; i < trackCenterLine.length; i++) {
+    ctx.lineTo(trackCenterLine[i].x, trackCenterLine[i].y);
+  }
+  ctx.closePath();
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Start/finish line (checkered)
+  if (startLine) {
+    const dx = startLine.x2 - startLine.x1;
+    const dy = startLine.y2 - startLine.y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const steps = 10;
+    const perpX = Math.cos(startLineDir) * 4;
+    const perpY = Math.sin(startLineDir) * 4;
+
+    for (let row = 0; row < 2; row++) {
+      for (let i = 0; i < steps; i++) {
+        const t = i / steps;
+        const x = startLine.x1 + dx * t + perpX * row;
+        const y = startLine.y1 + dy * t + perpY * row;
+        const w = dx / steps;
+        const h = dy / steps;
+        ctx.fillStyle = (i + row) % 2 === 0 ? '#fff' : '#222';
+        ctx.save();
+        ctx.translate(x + w / 2, y + h / 2);
+        ctx.rotate(startLineDir);
+        ctx.fillRect(-Math.abs(w) / 2, -Math.abs(h) / 2, Math.abs(w), Math.abs(perpY || perpX));
+        ctx.restore();
+      }
+    }
+  }
+}
+
+function drawCar(car) {
+  ctx.save();
+  ctx.translate(car.x, car.y);
+  ctx.rotate(car.angle);
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fillRect(-CAR_LENGTH / 2 + 2, -CAR_WIDTH / 2 + 2, CAR_LENGTH, CAR_WIDTH);
+
+  // Body
+  ctx.fillStyle = car.color;
+  ctx.fillRect(-CAR_LENGTH / 2, -CAR_WIDTH / 2, CAR_LENGTH, CAR_WIDTH);
+
+  // Windshield
+  ctx.fillStyle = 'rgba(150,200,255,0.6)';
+  ctx.fillRect(CAR_LENGTH / 2 - 7, -CAR_WIDTH / 2 + 2, 4, CAR_WIDTH - 4);
+
+  // Rear
+  ctx.fillStyle = '#222';
+  ctx.fillRect(-CAR_LENGTH / 2, -CAR_WIDTH / 2 + 1, 3, CAR_WIDTH - 2);
+
+  ctx.restore();
+}
+
+function drawUI() {
+  // Top bar background
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, W, 50);
+
+  // P1 info
+  drawOutlinedText(`P1`, 30, 15, 16, 'left', '#e33');
+  const p1LapText = gameState === 'racing' || gameState === 'roundEnd'
+    ? `Lap ${Math.min(cars[0].lap + 1, TOTAL_LAPS)}/${TOTAL_LAPS}`
+    : '';
+  drawOutlinedText(p1LapText, 70, 15, 14, 'left', '#fff');
+  // P1 round wins dots
+  for (let i = 0; i < TOTAL_ROUNDS; i++) {
+    ctx.beginPath();
+    ctx.arc(25 + i * 16, 36, 5, 0, Math.PI * 2);
+    ctx.fillStyle = i < p1Wins ? '#e33' : '#555';
+    ctx.fill();
+  }
+
+  // Round info
+  drawOutlinedText(`Round ${currentRound}/${TOTAL_ROUNDS}`, W / 2, 18, 18, 'center', '#fff');
+
+  // P2 info
+  drawOutlinedText(`P2`, W - 30, 15, 16, 'right', '#33e');
+  const p2LapText = gameState === 'racing' || gameState === 'roundEnd'
+    ? `Lap ${Math.min(cars[1].lap + 1, TOTAL_LAPS)}/${TOTAL_LAPS}`
+    : '';
+  drawOutlinedText(p2LapText, W - 70, 15, 14, 'right', '#fff');
+  for (let i = 0; i < TOTAL_ROUNDS; i++) {
+    ctx.beginPath();
+    ctx.arc(W - 25 - i * 16, 36, 5, 0, Math.PI * 2);
+    ctx.fillStyle = i < p2Wins ? '#33e' : '#555';
+    ctx.fill();
+  }
+
+  // Bottom controls hint
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(0, H - 25, W, 25);
+  drawOutlinedText('P1: \u2190 \u2192', 120, H - 12, 12, 'center', '#e88');
+  drawOutlinedText('P2: A / D', W - 120, H - 12, 12, 'center', '#88f');
+}
+
+function drawCountdown() {
+  drawTrack();
+  cars.forEach(drawCar);
+  drawUI();
+
+  const text = countdownValue > 0 ? countdownValue.toString() : 'GO!';
+  const scale = 1 + (countdownTimer % 1) * 0.2;
+  ctx.save();
+  ctx.translate(W / 2, H / 2);
+  ctx.scale(scale, scale);
+  drawOutlinedText(text, 0, 0, 72, 'center', countdownValue === 0 ? '#4f4' : '#fff');
+  ctx.restore();
+}
+
+function drawRoundEnd() {
+  drawTrack();
+  cars.forEach(drawCar);
+  drawUI();
+
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 50, W, H - 75);
+
+  const winnerName = roundWinner === 0 ? 'Player 1' : 'Player 2';
+  const winColor = roundWinner === 0 ? '#e33' : '#33e';
+  drawOutlinedText(`${winnerName} wins round ${currentRound}!`, W / 2, H / 2 - 20, 32, 'center', winColor);
+
+  if (currentRound < TOTAL_ROUNDS) {
+    drawOutlinedText('Next round starting...', W / 2, H / 2 + 25, 18, 'center', '#aaa');
+  }
+}
+
+function drawGameEnd() {
+  drawTrack();
+  cars.forEach(drawCar);
+
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, W, H);
+
+  const winner = p1Wins > p2Wins ? 1 : p2Wins > p1Wins ? 2 : 0;
+  const winText = winner === 0 ? "It's a tie!" : `Player ${winner} wins the race!`;
+  const winColor = winner === 1 ? '#e33' : winner === 2 ? '#33e' : '#fff';
+
+  drawOutlinedText('Race complete!', W / 2, H / 2 - 80, 28, 'center', '#fff');
+  drawOutlinedText(winText, W / 2, H / 2 - 30, 36, 'center', winColor);
+  drawOutlinedText(`Player 1: ${p1Wins} rounds   Player 2: ${p2Wins} rounds`, W / 2, H / 2 + 20, 20, 'center', '#ccc');
+  drawOutlinedText('Press any key to play again', W / 2, H / 2 + 70, 16, 'center', '#888');
+}
+
+function drawTitle() {
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, W, H);
+
+  // Animated background
+  for (let i = 0; i < 20; i++) {
+    const x = (gameTime * 30 + i * 50) % (W + 100) - 50;
+    const y = 100 + i * 25;
+    ctx.fillStyle = `rgba(255,255,255,0.03)`;
+    ctx.fillRect(x, y, 40, 8);
+  }
+
+  drawOutlinedText('2D Top-Down Racer', W / 2, H / 2 - 80, 42, 'center', '#fff');
+  drawOutlinedText('2 Player Hotseat', W / 2, H / 2 - 30, 22, 'center', '#aaa');
+
+  drawOutlinedText('Player 1 (Red):  \u2190  \u2192  Arrow Keys', W / 2, H / 2 + 30, 16, 'center', '#e88');
+  drawOutlinedText('Player 2 (Blue):  A  /  D', W / 2, H / 2 + 55, 16, 'center', '#88f');
+
+  drawOutlinedText(`${TOTAL_LAPS} laps \u00d7 ${TOTAL_ROUNDS} rounds`, W / 2, H / 2 + 100, 16, 'center', '#888');
+
+  const pulse = 0.7 + Math.sin(gameTime * 3) * 0.3;
+  ctx.globalAlpha = pulse;
+  drawOutlinedText('Press any key to start', W / 2, H / 2 + 150, 20, 'center', '#fff');
+  ctx.globalAlpha = 1;
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+function gameLoop() {
+  update();
+
+  switch (gameState) {
+    case 'title':
+      drawTitle();
+      break;
+    case 'countdown':
+      drawCountdown();
+      break;
+    case 'racing':
+      drawTrack();
+      cars.forEach(drawCar);
+      drawUI();
+      break;
+    case 'roundEnd':
+      drawRoundEnd();
+      break;
+    case 'gameEnd':
+      drawGameEnd();
+      break;
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+gameState = 'title';
+gameLoop();
+</script>
+</body>
+</html>
