@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hotseat Circuit</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --shell: #12151a;
+    --panel: #20242b;
+    --ink: #f8fbff;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background:
+      radial-gradient(circle at 18% 20%, rgba(206, 56, 48, 0.18), transparent 24rem),
+      radial-gradient(circle at 82% 74%, rgba(45, 126, 228, 0.18), transparent 26rem),
+      linear-gradient(135deg, #171b21, #0c0e12 58%, #151719);
+    color: var(--ink);
+    font-family: Impact, Haettenschweiler, "Arial Narrow Bold", sans-serif;
+    overflow: hidden;
+  }
+
+  body {
+    display: grid;
+    place-items: center;
+    padding: 18px;
+  }
+
+  .cabinet {
+    width: min(100%, 850px);
+    padding: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.26));
+    box-shadow: 0 28px 90px rgba(0, 0, 0, 0.55);
+    border-radius: 8px;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    image-rendering: auto;
+    border-radius: 4px;
+    background: #27612f;
+  }
+</style>
+</head>
+<body>
+<main class="cabinet">
+  <canvas id="game" width="800" height="600" aria-label="Two player top-down racing game"></canvas>
+</main>
+
+<script>
+'use strict';
+
+/* ============================================================
+ * Canvas and constants
+ * ============================================================ */
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+
+const ROAD_WIDTH = 92;
+const ROAD_HALF = ROAD_WIDTH / 2;
+const CAR_LENGTH = 28;
+const CAR_WIDTH = 15;
+const CAR_RADIUS = 12;
+const LAPS_PER_ROUND = 3;
+const TOTAL_ROUNDS = 3;
+
+const MAX_SPEED = 210;
+const AUTO_ACCEL = 138;
+const ASPHALT_DRAG = 0.982;
+const GRASS_DRAG = 0.915;
+const LATERAL_GRIP = 0.86;
+const TURN_RATE = 3.15;
+const BOUNCE = 135;
+
+const keys = Object.create(null);
+
+/* ============================================================
+ * Small math helpers
+ * ============================================================ */
+
+const rand = (min, max) => min + Math.random() * (max - min);
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const hypot = Math.hypot;
+
+function dot(ax, ay, bx, by) {
+  return ax * bx + ay * by;
+}
+
+function normalize(x, y) {
+  const len = hypot(x, y) || 1;
+  return { x: x / len, y: y / len };
+}
+
+function catmull(p0, p1, p2, p3, t) {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return {
+    x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+    y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+  };
+}
+
+/* ============================================================
+ * Procedural sound
+ * ============================================================ */
+
+let audio = null;
+
+function initAudio() {
+  if (audio) {
+    if (audio.ctx.state === 'suspended') audio.ctx.resume();
+    return;
+  }
+
+  const actx = new (window.AudioContext || window.webkitAudioContext)();
+  const master = actx.createGain();
+  master.gain.value = 0.7;
+  master.connect(actx.destination);
+
+  const noiseBuffer = actx.createBuffer(1, Math.floor(actx.sampleRate * 0.24), actx.sampleRate);
+  const data = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+
+  const engines = [64, 72].map((base, index) => {
+    const osc = actx.createOscillator();
+    const filter = actx.createBiquadFilter();
+    const gain = actx.createGain();
+    const pan = actx.createStereoPanner();
+    osc.type = 'sawtooth';
+    osc.frequency.value = base;
+    filter.type = 'lowpass';
+    filter.frequency.value = 420;
+    gain.gain.value = 0;
+    pan.pan.value = index === 0 ? -0.28 : 0.28;
+    osc.connect(filter).connect(gain).connect(pan).connect(master);
+    osc.start();
+    return { osc, filter, gain, base };
+  });
+
+  audio = { ctx: actx, master, noiseBuffer, engines };
+  if (game.state === 'countdown') startBeepsFromElapsed(performance.now() - game.countdownStart);
+}
+
+function tone(freq, duration = 0.12, volume = 0.25, type = 'square', delay = 0) {
+  if (!audio) return;
+  const now = audio.ctx.currentTime + delay;
+  const osc = audio.ctx.createOscillator();
+  const gain = audio.ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, now);
+  gain.gain.setValueAtTime(volume, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+  osc.connect(gain).connect(audio.master);
+  osc.start(now);
+  osc.stop(now + duration + 0.04);
+}
+
+function startBeeps() {
+  tone(330, 0.1, 0.24, 'square', 0);
+  tone(330, 0.1, 0.24, 'square', 1);
+  tone(330, 0.1, 0.24, 'square', 2);
+  tone(660, 0.36, 0.3, 'sawtooth', 3);
+}
+
+function startBeepsFromElapsed(elapsedMs) {
+  const schedule = [
+    { at: 0, freq: 330, dur: 0.1, vol: 0.24, type: 'square' },
+    { at: 1000, freq: 330, dur: 0.1, vol: 0.24, type: 'square' },
+    { at: 2000, freq: 330, dur: 0.1, vol: 0.24, type: 'square' },
+    { at: 3000, freq: 660, dur: 0.36, vol: 0.3, type: 'sawtooth' }
+  ];
+  for (const item of schedule) {
+    if (item.at >= elapsedMs - 80) {
+      tone(item.freq, item.dur, item.vol, item.type, Math.max(0, (item.at - elapsedMs) / 1000));
+    }
+  }
+}
+
+function lapBeep() {
+  tone(860, 0.08, 0.22, 'triangle');
+  tone(1120, 0.08, 0.18, 'triangle', 0.09);
+}
+
+function fanfare() {
+  [523, 659, 784, 1047].forEach((freq, i) => tone(freq, 0.18, 0.24, 'triangle', i * 0.14));
+}
+
+function collisionThud(strength) {
+  if (!audio) return;
+  const now = audio.ctx.currentTime;
+  const src = audio.ctx.createBufferSource();
+  const filter = audio.ctx.createBiquadFilter();
+  const gain = audio.ctx.createGain();
+  src.buffer = audio.noiseBuffer;
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(130 + strength * 4, now);
+  gain.gain.setValueAtTime(clamp(0.08 + strength / 850, 0.08, 0.34), now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+  src.connect(filter).connect(gain).connect(audio.master);
+  src.start(now);
+  src.stop(now + 0.2);
+}
+
+function updateEngines() {
+  if (!audio) return;
+  const running = game.state === 'racing';
+  game.cars.forEach((car, i) => {
+    const speed = hypot(car.vx, car.vy);
+    const engine = audio.engines[i];
+    const load = clamp(speed / MAX_SPEED, 0, 1);
+    const t = audio.ctx.currentTime;
+    engine.osc.frequency.setTargetAtTime(engine.base + load * 165 + Math.sin(performance.now() * 0.012 + i) * 5, t, 0.03);
+    engine.filter.frequency.setTargetAtTime(380 + load * 900, t, 0.04);
+    engine.gain.gain.setTargetAtTime(running ? 0.045 + load * 0.065 : 0, t, 0.06);
+  });
+}
+
+/* ============================================================
+ * Track generation and geometry
+ * ============================================================ */
+
+function generateTrack() {
+  const margin = ROAD_HALF + 20;
+
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const count = Math.floor(rand(6, 11));
+    const center = { x: W / 2, y: H / 2 + rand(-8, 10) };
+    const points = [];
+
+    for (let i = 0; i < count; i++) {
+      const angle = (i / count) * Math.PI * 2 + rand(-0.23, 0.23);
+      const rx = rand(175, 295);
+      const ry = rand(128, 208);
+      points.push({
+        x: clamp(center.x + Math.cos(angle) * rx, margin + 22, W - margin - 22),
+        y: clamp(center.y + Math.sin(angle) * ry, margin + 22, H - margin - 22),
+        angle
+      });
+    }
+
+    points.sort((a, b) => a.angle - b.angle);
+
+    const samples = [];
+    const stepsPerSegment = 18;
+    for (let i = 0; i < points.length; i++) {
+      const p0 = points[(i - 1 + points.length) % points.length];
+      const p1 = points[i];
+      const p2 = points[(i + 1) % points.length];
+      const p3 = points[(i + 2) % points.length];
+      for (let s = 0; s < stepsPerSegment; s++) {
+        samples.push(catmull(p0, p1, p2, p3, s / stepsPerSegment));
+      }
+    }
+
+    if (!samples.every(p => p.x >= margin && p.x <= W - margin && p.y >= margin && p.y <= H - margin)) {
+      continue;
+    }
+
+    let length = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const a = samples[i];
+      const b = samples[(i + 1) % samples.length];
+      a.nextDistance = hypot(b.x - a.x, b.y - a.y);
+      length += a.nextDistance;
+    }
+
+    const tangent = normalize(samples[1].x - samples[0].x, samples[1].y - samples[0].y);
+    return {
+      points,
+      samples,
+      length,
+      start: samples[0],
+      startTangent: tangent,
+      startNormal: { x: -tangent.y, y: tangent.x }
+    };
+  }
+
+  const samples = [
+    { x: 240, y: 160 },
+    { x: 560, y: 160 },
+    { x: 650, y: 300 },
+    { x: 540, y: 445 },
+    { x: 260, y: 440 },
+    { x: 150, y: 300 }
+  ];
+  for (let i = 0; i < samples.length; i++) {
+    const b = samples[(i + 1) % samples.length];
+    samples[i].nextDistance = hypot(b.x - samples[i].x, b.y - samples[i].y);
+  }
+  const tangent = normalize(samples[1].x - samples[0].x, samples[1].y - samples[0].y);
+  return {
+    points: samples,
+    samples,
+    length: samples.reduce((sum, p) => sum + p.nextDistance, 0),
+    start: samples[0],
+    startTangent: tangent,
+    startNormal: { x: -tangent.y, y: tangent.x }
+  };
+}
+
+function nearestTrackPoint(track, x, y) {
+  let best = null;
+  let bestDistSq = Infinity;
+  const samples = track.samples;
+
+  for (let i = 0; i < samples.length; i++) {
+    const a = samples[i];
+    const b = samples[(i + 1) % samples.length];
+    const abx = b.x - a.x;
+    const aby = b.y - a.y;
+    const lenSq = abx * abx + aby * aby || 1;
+    const t = clamp(((x - a.x) * abx + (y - a.y) * aby) / lenSq, 0, 1);
+    const px = a.x + abx * t;
+    const py = a.y + aby * t;
+    const dx = x - px;
+    const dy = y - py;
+    const distSq = dx * dx + dy * dy;
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      best = { x: px, y: py, dx, dy, dist: Math.sqrt(distSq), index: i, t };
+    }
+  }
+  return best;
+}
+
+function startSignedDistance(track, car) {
+  return dot(car.x - track.start.x, car.y - track.start.y, track.startTangent.x, track.startTangent.y);
+}
+
+function startLateralDistance(track, car) {
+  return Math.abs(dot(car.x - track.start.x, car.y - track.start.y, track.startNormal.x, track.startNormal.y));
+}
+
+/* ============================================================
+ * Game state
+ * ============================================================ */
+
+const game = {
+  state: 'countdown',
+  round: 1,
+  wins: [0, 0],
+  message: '',
+  messageUntil: 0,
+  countdownStart: 0,
+  lastTime: 0,
+  track: null,
+  cars: []
+};
+
+function makeCar(player, color, sideOffset) {
+  const start = game.track.start;
+  const t = game.track.startTangent;
+  const n = game.track.startNormal;
+  return {
+    player,
+    color,
+    x: start.x - t.x * 34 + n.x * sideOffset,
+    y: start.y - t.y * 34 + n.y * sideOffset,
+    px: start.x - t.x * 34 + n.x * sideOffset,
+    py: start.y - t.y * 34 + n.y * sideOffset,
+    vx: t.x * 40,
+    vy: t.y * 40,
+    angle: Math.atan2(t.y, t.x),
+    lap: 0,
+    halfway: false,
+    offRoad: false,
+    lastCross: -999,
+    signed: -34
+  };
+}
+
+function startRound() {
+  game.track = generateTrack();
+  game.cars = [
+    makeCar(1, '#e33d36', -15),
+    makeCar(2, '#2d7ee4', 15)
+  ];
+  game.state = 'countdown';
+  game.countdownStart = performance.now();
+  game.message = '';
+  startBeeps();
+}
+
+function resetMatch() {
+  game.round = 1;
+  game.wins = [0, 0];
+  startRound();
+}
+
+function finishRound(winnerIndex) {
+  game.state = 'roundover';
+  game.wins[winnerIndex]++;
+  game.message = `PLAYER ${winnerIndex + 1} WINS ROUND ${game.round}`;
+  game.messageUntil = performance.now() + 2300;
+  fanfare();
+}
+
+function finishMatch() {
+  game.state = 'gameover';
+  const winner = game.wins[0] === game.wins[1] ? 0 : (game.wins[0] > game.wins[1] ? 1 : 2);
+  game.message = winner ? `PLAYER ${winner} WINS THE MATCH` : 'MATCH DRAW';
+  game.messageUntil = Infinity;
+}
+
+/* ============================================================
+ * Input and update
+ * ============================================================ */
+
+window.addEventListener('keydown', event => {
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' ', 'a', 'd', 'A', 'D'].includes(event.key)) {
+    event.preventDefault();
+  }
+  keys[event.key.toLowerCase()] = true;
+  initAudio();
+  if (game.state === 'gameover' && event.key === ' ') resetMatch();
+});
+
+window.addEventListener('keyup', event => {
+  keys[event.key.toLowerCase()] = false;
+});
+
+window.addEventListener('blur', () => {
+  for (const key in keys) keys[key] = false;
+});
+
+canvas.addEventListener('pointerdown', initAudio);
+
+function updateCar(car, dt) {
+  car.px = car.x;
+  car.py = car.y;
+
+  const left = car.player === 1 ? keys.arrowleft : keys.a;
+  const right = car.player === 1 ? keys.arrowright : keys.d;
+  const steer = (left ? -1 : 0) + (right ? 1 : 0);
+  const speed = hypot(car.vx, car.vy);
+  const speedRatio = clamp(speed / MAX_SPEED, 0.22, 1);
+
+  car.angle += steer * TURN_RATE * speedRatio * dt;
+
+  const fx = Math.cos(car.angle);
+  const fy = Math.sin(car.angle);
+  const lx = -fy;
+  const ly = fx;
+  const forwardVel = dot(car.vx, car.vy, fx, fy);
+  const lateralVel = dot(car.vx, car.vy, lx, ly) * LATERAL_GRIP;
+
+  let newForward = forwardVel + AUTO_ACCEL * dt;
+  if (newForward > MAX_SPEED) newForward = MAX_SPEED;
+
+  car.vx = fx * newForward + lx * lateralVel;
+  car.vy = fy * newForward + ly * lateralVel;
+
+  const nearest = nearestTrackPoint(game.track, car.x, car.y);
+  car.offRoad = nearest.dist > ROAD_HALF - CAR_RADIUS * 0.45;
+  const drag = Math.pow(car.offRoad ? GRASS_DRAG : ASPHALT_DRAG, dt * 60);
+  car.vx *= drag;
+  car.vy *= drag;
+
+  car.x += car.vx * dt;
+  car.y += car.vy * dt;
+
+  const after = nearestTrackPoint(game.track, car.x, car.y);
+  const limit = ROAD_HALF - CAR_RADIUS * 0.35;
+  if (after.dist > limit) {
+    const nx = after.dx / (after.dist || 1);
+    const ny = after.dy / (after.dist || 1);
+    const excess = after.dist - limit;
+    car.x -= nx * excess * 0.92;
+    car.y -= ny * excess * 0.92;
+    const outward = dot(car.vx, car.vy, nx, ny);
+    if (outward > 0) {
+      car.vx -= nx * outward * 1.3;
+      car.vy -= ny * outward * 1.3;
+    }
+    car.vx *= 0.965;
+    car.vy *= 0.965;
+    car.offRoad = true;
+  }
+
+  car.x = clamp(car.x, CAR_RADIUS, W - CAR_RADIUS);
+  car.y = clamp(car.y, CAR_RADIUS, H - CAR_RADIUS);
+
+  updateLapState(car);
+}
+
+function updateLapState(car) {
+  const nearest = nearestTrackPoint(game.track, car.x, car.y);
+  if (nearest.index > game.track.samples.length * 0.42 && nearest.index < game.track.samples.length * 0.64) {
+    car.halfway = true;
+  }
+
+  const signed = startSignedDistance(game.track, car);
+  const lateral = startLateralDistance(game.track, car);
+  const now = performance.now();
+  if (car.halfway && car.signed < 0 && signed >= 0 && lateral <= ROAD_HALF && now - car.lastCross > 1500) {
+    car.lap++;
+    car.halfway = false;
+    car.lastCross = now;
+    lapBeep();
+    if (car.lap >= LAPS_PER_ROUND) finishRound(car.player - 1);
+  }
+  car.signed = signed;
+}
+
+function resolveCarCollision() {
+  const a = game.cars[0];
+  const b = game.cars[1];
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dist = hypot(dx, dy) || 1;
+  const minDist = CAR_RADIUS * 2;
+  if (dist >= minDist) return;
+
+  const nx = dx / dist;
+  const ny = dy / dist;
+  const overlap = minDist - dist;
+  a.x -= nx * overlap * 0.5;
+  a.y -= ny * overlap * 0.5;
+  b.x += nx * overlap * 0.5;
+  b.y += ny * overlap * 0.5;
+
+  const rel = dot(a.vx - b.vx, a.vy - b.vy, nx, ny);
+  const impulse = Math.max(BOUNCE, Math.abs(rel) * 0.9);
+  a.vx -= nx * impulse * 0.45;
+  a.vy -= ny * impulse * 0.45;
+  b.vx += nx * impulse * 0.45;
+  b.vy += ny * impulse * 0.45;
+  collisionThud(impulse);
+}
+
+function update(dt) {
+  updateEngines();
+
+  if (game.state === 'countdown') {
+    const elapsed = performance.now() - game.countdownStart;
+    if (elapsed >= 4000) game.state = 'racing';
+    return;
+  }
+
+  if (game.state === 'roundover' && performance.now() >= game.messageUntil) {
+    if (game.round >= TOTAL_ROUNDS) {
+      finishMatch();
+    } else {
+      game.round++;
+      startRound();
+    }
+    return;
+  }
+
+  if (game.state !== 'racing') return;
+
+  game.cars.forEach(car => updateCar(car, dt));
+  resolveCarCollision();
+}
+
+/* ============================================================
+ * Drawing
+ * ============================================================ */
+
+function pathTrack(width, strokeStyle, dash = []) {
+  const samples = game.track.samples;
+  ctx.save();
+  ctx.lineWidth = width;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = strokeStyle;
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  ctx.moveTo(samples[0].x, samples[0].y);
+  for (let i = 1; i < samples.length; i++) ctx.lineTo(samples[i].x, samples[i].y);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBackground() {
+  ctx.fillStyle = '#27612f';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.globalAlpha = 0.18;
+  for (let i = 0; i < 150; i++) {
+    const x = (i * 73) % W;
+    const y = (i * 151) % H;
+    ctx.fillStyle = i % 3 ? '#143c22' : '#9c7c40';
+    ctx.fillRect(x, y, 3 + (i % 5), 1 + (i % 4));
+  }
+  ctx.restore();
+}
+
+function drawTrack() {
+  pathTrack(ROAD_WIDTH + 18, '#8c7247');
+  pathTrack(ROAD_WIDTH + 8, '#f1f0e5');
+  pathTrack(ROAD_WIDTH, '#30343a');
+  pathTrack(ROAD_WIDTH - 16, '#262a30');
+  pathTrack(4, 'rgba(255,255,255,0.72)', [22, 22]);
+  drawStartLine();
+}
+
+function drawStartLine() {
+  const start = game.track.start;
+  const n = game.track.startNormal;
+  const t = game.track.startTangent;
+  const cells = 8;
+  const cellW = ROAD_WIDTH / cells;
+  const depth = 16;
+
+  ctx.save();
+  ctx.translate(start.x, start.y);
+  ctx.rotate(Math.atan2(n.y, n.x));
+  ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(-ROAD_HALF, -depth / 2, ROAD_WIDTH, depth);
+  for (let i = 0; i < cells; i++) {
+    for (let j = 0; j < 2; j++) {
+      ctx.fillStyle = (i + j) % 2 === 0 ? '#f5f6f1' : '#111318';
+      ctx.fillRect(-ROAD_HALF + i * cellW, -depth / 2 + j * depth / 2, cellW, depth / 2);
+    }
+  }
+  ctx.restore();
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.36)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(start.x - t.x * 28, start.y - t.y * 28);
+  ctx.lineTo(start.x + t.x * 28, start.y + t.y * 28);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawCar(car) {
+  ctx.save();
+  ctx.translate(car.x, car.y);
+  ctx.rotate(car.angle);
+
+  ctx.shadowColor = 'rgba(0,0,0,0.45)';
+  ctx.shadowBlur = 8;
+  ctx.shadowOffsetY = 3;
+  ctx.fillStyle = '#101216';
+  ctx.fillRect(-CAR_LENGTH / 2 - 1, -CAR_WIDTH / 2 - 1, CAR_LENGTH + 2, CAR_WIDTH + 2);
+  ctx.shadowColor = 'transparent';
+
+  ctx.fillStyle = car.color;
+  roundedRect(-CAR_LENGTH / 2, -CAR_WIDTH / 2, CAR_LENGTH, CAR_WIDTH, 3);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(255,255,255,0.76)';
+  ctx.fillRect(1, -CAR_WIDTH / 2 + 2, 7, CAR_WIDTH - 4);
+  ctx.fillStyle = '#111318';
+  ctx.fillRect(-9, -CAR_WIDTH / 2 + 2, 6, CAR_WIDTH - 4);
+  ctx.fillStyle = '#ffd95a';
+  ctx.fillRect(CAR_LENGTH / 2 - 2, -CAR_WIDTH / 2 + 2, 3, 4);
+  ctx.fillRect(CAR_LENGTH / 2 - 2, CAR_WIDTH / 2 - 6, 3, 4);
+
+  ctx.restore();
+}
+
+function roundedRect(x, y, width, height, radius) {
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + width, y, x + width, y + height, radius);
+  ctx.arcTo(x + width, y + height, x, y + height, radius);
+  ctx.arcTo(x, y + height, x, y, radius);
+  ctx.arcTo(x, y, x + width, y, radius);
+  ctx.closePath();
+}
+
+function textOutlined(text, x, y, size, align = 'left', fill = '#fff') {
+  ctx.save();
+  ctx.font = `${size}px Impact, Haettenschweiler, Arial Narrow, sans-serif`;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = 'rgba(0,0,0,0.86)';
+  ctx.lineWidth = Math.max(4, size * 0.16);
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = fill;
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+
+function drawWinDots(x, y, color, count) {
+  for (let i = 0; i < TOTAL_ROUNDS; i++) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(x + i * 18, y, 6, 0, Math.PI * 2);
+    ctx.fillStyle = i < count ? color : 'rgba(255,255,255,0.18)';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawHud() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(10,12,16,0.62)';
+  ctx.fillRect(0, 0, W, 58);
+  ctx.restore();
+
+  textOutlined(`P1 LAP ${Math.min(game.cars[0].lap, LAPS_PER_ROUND)}/${LAPS_PER_ROUND}`, 20, 27, 24, 'left', '#ff5b54');
+  textOutlined(`ROUND ${game.round}/${TOTAL_ROUNDS}`, W / 2, 27, 25, 'center');
+  textOutlined(`P2 LAP ${Math.min(game.cars[1].lap, LAPS_PER_ROUND)}/${LAPS_PER_ROUND}`, W - 20, 27, 24, 'right', '#5fa1ff');
+  drawWinDots(154, 28, '#ff5b54', game.wins[0]);
+  drawWinDots(W - 204, 28, '#5fa1ff', game.wins[1]);
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(10,12,16,0.54)';
+  ctx.fillRect(0, H - 34, W, 34);
+  ctx.restore();
+  textOutlined('P1 STEER: LEFT / RIGHT ARROWS', 22, H - 17, 16, 'left');
+  textOutlined('P2 STEER: A / D', W - 22, H - 17, 16, 'right');
+}
+
+function drawOverlay() {
+  let message = '';
+  let sub = '';
+
+  if (game.state === 'countdown') {
+    const elapsed = performance.now() - game.countdownStart;
+    const index = Math.floor(elapsed / 1000);
+    message = ['3', '2', '1', 'GO!'][clamp(index, 0, 3)];
+    sub = 'GET READY';
+  } else if (game.state === 'roundover') {
+    message = game.message;
+    sub = 'NEXT ROUND LOADING';
+  } else if (game.state === 'gameover') {
+    message = game.message;
+    sub = 'PRESS SPACE FOR A NEW MATCH';
+  }
+
+  if (!message) return;
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.38)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+
+  textOutlined(message, W / 2, H / 2 - 12, game.state === 'countdown' ? 82 : 46, 'center');
+  textOutlined(sub, W / 2, H / 2 + 54, 22, 'center', '#f3d060');
+}
+
+function render() {
+  drawBackground();
+  drawTrack();
+  game.cars.forEach(drawCar);
+  drawHud();
+  drawOverlay();
+}
+
+/* ============================================================
+ * Main loop
+ * ============================================================ */
+
+function frame(now) {
+  const dt = Math.min(0.033, (now - game.lastTime) / 1000 || 0);
+  game.lastTime = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+resetMatch();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

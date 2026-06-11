@@ -21,6 +21,7 @@ Each directory contains one model's single-file attempt. Open the HTML file dire
 
 | Model              | File                                           |
 | ------------------ | ---------------------------------------------- |
+| Claude Fable 5     | [`fable-5/index.html`](./fable-5/index.html)               |
 | Claude Opus 4.6    | [`opus-4.6/index.html`](./opus-4.6/index.html)             |
 | Claude Opus 4.5    | [`opus-4.5/index.html`](./opus-4.5/index.html)             |
 | Gemini 3.1 Pro     | [`gemini-3.1-pro/index.html`](./gemini-3.1-pro/index.html) |
@@ -32,6 +33,8 @@ Each directory contains one model's single-file attempt. Open the HTML file dire
 | MiniMax 2.5        | [`minimax-2.5/racing.html`](./minimax-2.5/racing.html)     |
 
 MiniMax 2.5 also produced a [`SPEC.md`](./minimax-2.5/SPEC.md) alongside its implementation.
+
+Outside the benchmark, Claude Fable 5 also made a bonus top-down 3D remake in [`fable-5-3d/index.html`](./fable-5-3d/index.html), with upgraded track generation (chicanes, elevation, curbs, self-intersection checks). It uses Three.js from a CDN, so it needs network access on first load.
 
 ## Running
 
