@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hotseat Circuit — 2P Racing</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0d1117;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    canvas {
+      display: block;
+      background: #1a3a1a;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+      border-radius: 4px;
+      max-width: 100vw;
+      max-height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="800" height="600"></canvas>
+  <script>
+/* =============================================================================
+   Hotseat Circuit — 2-player top-down racing
+   Single-file vanilla JS + Canvas + Web Audio API
+   ============================================================================= */
+
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------------------
+  // Constants
+  // ---------------------------------------------------------------------------
+  const W = 800;
+  const H = 600;
+  const LAPS_PER_ROUND = 3;
+  const ROUNDS_TOTAL = 3;
+
+  const CAR_LENGTH = 22;
+  const CAR_WIDTH = 12;
+  const BASE_SPEED = 2.6;
+  const GRASS_SPEED_MULT = 0.42;
+  const TURN_RATE = 0.055;
+  const DRIFT = 0.88;
+  const ACCEL_SMOOTH = 0.08;
+  const COLLISION_PUSH = 3.2;
+  const OFFROAD_PUSH = 1.8;
+  const ROAD_HALF_WIDTH = 38;
+
+  // ---------------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------------
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  // ---------------------------------------------------------------------------
+  // Input
+  // ---------------------------------------------------------------------------
+  const keys = Object.create(null);
+
+  window.addEventListener("keydown", (e) => {
+    keys[e.code] = true;
+    // Prevent arrow-key scrolling
+    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"].includes(e.code)) {
+      e.preventDefault();
+    }
+    // Unlock audio on first interaction
+    ensureAudio();
+    if (state.phase === "title" && (e.code === "Space" || e.code === "Enter")) {
+      startMatch();
+    }
+    if (state.phase === "end" && (e.code === "Space" || e.code === "Enter")) {
+      resetToTitle();
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    keys[e.code] = false;
+  });
+
+  // ---------------------------------------------------------------------------
+  // Web Audio API — all sounds generated procedurally
+  // ---------------------------------------------------------------------------
+  let audioCtx = null;
+  let engineNodes = [null, null]; // { osc, gain, filter } per car
+  let masterGain = null;
+
+  function ensureAudio() {
+    if (audioCtx) return;
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.35;
+      masterGain.connect(audioCtx.destination);
+      createEngines();
+    } catch (_) {
+      /* audio unavailable */
+    }
+  }
+
+  function createEngines() {
+    for (let i = 0; i < 2; i++) {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      const filter = audioCtx.createBiquadFilter();
+      osc.type = "sawtooth";
+      osc.frequency.value = 80;
+      filter.type = "lowpass";
+      filter.frequency.value = 400;
+      gain.gain.value = 0;
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(masterGain);
+      osc.start();
+      engineNodes[i] = { osc, gain, filter };
+    }
+  }
+
+  function updateEngineSound(carIndex, speed, racing) {
+    if (!audioCtx || !engineNodes[carIndex]) return;
+    const n = engineNodes[carIndex];
+    const t = audioCtx.currentTime;
+    if (!racing) {
+      n.gain.gain.setTargetAtTime(0, t, 0.05);
+      return;
+    }
+    const norm = Math.min(1, Math.abs(speed) / (BASE_SPEED * 1.2));
+    n.osc.frequency.setTargetAtTime(70 + norm * 140, t, 0.05);
+    n.filter.frequency.setTargetAtTime(300 + norm * 800, t, 0.05);
+    n.gain.gain.setTargetAtTime(0.04 + norm * 0.08, t, 0.05);
+  }
+
+  function stopEngines() {
+    for (let i = 0; i < 2; i++) updateEngineSound(i, 0, false);
+  }
+
+  /** Short noise burst for car-car collision */
+  function playCollision() {
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const bufferSize = audioCtx.sampleRate * 0.12;
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.25));
+    }
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = 600;
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0.5, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(masterGain);
+    src.start(t);
+  }
+
+  /** Lap complete beep */
+  function playLapBeep() {
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(660, t);
+    osc.frequency.setValueAtTime(880, t + 0.08);
+    gain.gain.setValueAtTime(0.15, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start(t);
+    osc.stop(t + 0.22);
+  }
+
+  /** Round win fanfare */
+  function playRoundWin() {
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    notes.forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "triangle";
+      osc.frequency.value = freq;
+      const start = t + i * 0.12;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(0.18, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.35);
+      osc.connect(gain);
+      gain.connect(masterGain);
+      osc.start(start);
+      osc.stop(start + 0.4);
+    });
+  }
+
+  /** Countdown beep: pitch rises for 3-2-1, longer higher for GO */
+  function playCountdownBeep(isGo) {
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sine";
+    if (isGo) {
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.22, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+      osc.connect(gain);
+      gain.connect(masterGain);
+      osc.start(t);
+      osc.stop(t + 0.42);
+    } else {
+      osc.frequency.value = 440;
+      gain.gain.setValueAtTime(0.18, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+      osc.connect(gain);
+      gain.connect(masterGain);
+      osc.start(t);
+      osc.stop(t + 0.18);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Math helpers
+  // ---------------------------------------------------------------------------
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function dist(ax, ay, bx, by) {
+    const dx = bx - ax;
+    const dy = by - ay;
+    return Math.hypot(dx, dy);
+  }
+
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function normalizeAngle(a) {
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Track generation
+  // Place random waypoints around center, sort by angle, Catmull-Rom spline
+  // ---------------------------------------------------------------------------
+  function generateTrack() {
+    const cx = W / 2;
+    const cy = H / 2;
+    const n = 6 + Math.floor(Math.random() * 5); // 6–10 waypoints
+    const margin = ROAD_HALF_WIDTH + 28;
+    const minR = 90;
+    const maxRx = (W / 2) - margin;
+    const maxRy = (H / 2) - margin;
+
+    const waypoints = [];
+    for (let i = 0; i < n; i++) {
+      // Seed angles roughly evenly, then jitter
+      const baseAngle = (i / n) * Math.PI * 2;
+      const angle = baseAngle + (Math.random() - 0.5) * (Math.PI * 2 / n) * 0.55;
+      const rx = minR + Math.random() * (maxRx - minR);
+      const ry = minR + Math.random() * (maxRy - minR);
+      let x = cx + Math.cos(angle) * rx;
+      let y = cy + Math.sin(angle) * ry;
+      x = clamp(x, margin, W - margin);
+      y = clamp(y, margin, H - margin);
+      waypoints.push({ x, y, angle: Math.atan2(y - cy, x - cx) });
+    }
+    waypoints.sort((a, b) => a.angle - b.angle);
+
+    // Build dense centerline via Catmull-Rom (closed loop)
+    const pts = waypoints.map((p) => ({ x: p.x, y: p.y }));
+    const centerline = [];
+    const samplesPerSeg = 28;
+    const len = pts.length;
+
+    for (let i = 0; i < len; i++) {
+      const p0 = pts[(i - 1 + len) % len];
+      const p1 = pts[i];
+      const p2 = pts[(i + 1) % len];
+      const p3 = pts[(i + 2) % len];
+      for (let s = 0; s < samplesPerSeg; s++) {
+        const t = s / samplesPerSeg;
+        centerline.push(catmullRom(p0, p1, p2, p3, t));
+      }
+    }
+
+    // Resample to more uniform spacing
+    const uniform = resamplePath(centerline, 4);
+    // Ensure closed
+    if (dist(uniform[0].x, uniform[0].y, uniform[uniform.length - 1].x, uniform[uniform.length - 1].y) > 1) {
+      uniform.push({ x: uniform[0].x, y: uniform[0].y });
+    }
+
+    // Precompute cumulative arc length and tangents
+    const arc = [0];
+    for (let i = 1; i < uniform.length; i++) {
+      arc.push(arc[i - 1] + dist(uniform[i - 1].x, uniform[i - 1].y, uniform[i].x, uniform[i].y));
+    }
+    const totalLen = arc[arc.length - 1];
+
+    // Start/finish near first waypoint (index 0 of original, mapped to sample 0)
+    const startIdx = 0;
+    const start = uniform[startIdx];
+    const next = uniform[(startIdx + 3) % (uniform.length - 1)];
+    const startAngle = Math.atan2(next.y - start.y, next.x - start.x);
+
+    // Offsets for road edges (for drawing)
+    const leftEdge = [];
+    const rightEdge = [];
+    for (let i = 0; i < uniform.length - 1; i++) {
+      const a = uniform[i];
+      const b = uniform[(i + 1) % (uniform.length - 1)] || uniform[i + 1];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const lenSeg = Math.hypot(dx, dy) || 1;
+      const nx = -dy / lenSeg;
+      const ny = dx / lenSeg;
+      leftEdge.push({ x: a.x + nx * ROAD_HALF_WIDTH, y: a.y + ny * ROAD_HALF_WIDTH });
+      rightEdge.push({ x: a.x - nx * ROAD_HALF_WIDTH, y: a.y - ny * ROAD_HALF_WIDTH });
+    }
+    // Close edges
+    leftEdge.push({ x: leftEdge[0].x, y: leftEdge[0].y });
+    rightEdge.push({ x: rightEdge[0].x, y: rightEdge[0].y });
+
+    return {
+      centerline: uniform,
+      leftEdge,
+      rightEdge,
+      arc,
+      totalLen,
+      start,
+      startAngle,
+      halfWidth: ROAD_HALF_WIDTH,
+    };
+  }
+
+  function catmullRom(p0, p1, p2, p3, t) {
+    const t2 = t * t;
+    const t3 = t2 * t;
+    return {
+      x:
+        0.5 *
+        (2 * p1.x +
+          (-p0.x + p2.x) * t +
+          (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+          (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+      y:
+        0.5 *
+        (2 * p1.y +
+          (-p0.y + p2.y) * t +
+          (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+          (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3),
+    };
+  }
+
+  function resamplePath(pts, spacing) {
+    if (pts.length < 2) return pts.slice();
+    const out = [{ x: pts[0].x, y: pts[0].y }];
+    let carry = 0;
+    for (let i = 1; i < pts.length; i++) {
+      let x0 = pts[i - 1].x;
+      let y0 = pts[i - 1].y;
+      let x1 = pts[i].x;
+      let y1 = pts[i].y;
+      let segLen = dist(x0, y0, x1, y1);
+      if (segLen < 1e-6) continue;
+      let remaining = segLen + carry;
+      let dirX = (x1 - x0) / segLen;
+      let dirY = (y1 - y0) / segLen;
+      let used = -carry;
+      while (remaining >= spacing) {
+        used += spacing;
+        out.push({ x: x0 + dirX * used, y: y0 + dirY * used });
+        remaining -= spacing;
+      }
+      carry = remaining;
+    }
+    return out;
+  }
+
+  /**
+   * Distance from point to nearest centerline sample.
+   * Returns { dist, index, signed (left/right), progress 0..1, tangent }
+   */
+  function nearestOnTrack(track, x, y) {
+    let bestD = Infinity;
+    let bestI = 0;
+    const cl = track.centerline;
+    const n = cl.length - 1; // last == first-ish
+    for (let i = 0; i < n; i++) {
+      const d = dist(x, y, cl[i].x, cl[i].y);
+      if (d < bestD) {
+        bestD = d;
+        bestI = i;
+      }
+    }
+    const a = cl[bestI];
+    const b = cl[(bestI + 1) % n];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const segLen = Math.hypot(dx, dy) || 1;
+    const tx = dx / segLen;
+    const ty = dy / segLen;
+    // Signed side: cross product of tangent × (point - a)
+    const signed = (x - a.x) * ty - (y - a.y) * (-tx); // wait: nx = -ty, ny = tx for left
+    // Cross of tangent and to-point: tx*(y-a.y) - ty*(x-a.x) > 0 => left of direction
+    const cross = tx * (y - a.y) - ty * (x - a.x);
+    const progress = track.arc[bestI] / track.totalLen;
+    return {
+      dist: bestD,
+      index: bestI,
+      onRoad: bestD <= track.halfWidth,
+      signedCross: cross,
+      progress,
+      tangent: Math.atan2(ty, tx),
+      nearest: a,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Car
+  // ---------------------------------------------------------------------------
+  function createCar(color, colorDark) {
+    return {
+      x: 0,
+      y: 0,
+      angle: 0,
+      speed: 0,
+      vx: 0,
+      vy: 0,
+      color,
+      colorDark,
+      lap: 0,
+      progress: 0,
+      lastProgress: 0,
+      crossedOnce: false, // require leaving start zone first
+      finished: false,
+    };
+  }
+
+  function placeCarsAtStart(track, cars) {
+    const a = track.startAngle;
+    const perp = a + Math.PI / 2;
+    const ox = Math.cos(perp) * 10;
+    const oy = Math.sin(perp) * 10;
+    // Slightly behind start line along track
+    const back = 18;
+    const bx = Math.cos(a) * -back;
+    const by = Math.sin(a) * -back;
+
+    cars[0].x = track.start.x + bx + ox;
+    cars[0].y = track.start.y + by + oy;
+    cars[0].angle = a;
+    cars[0].speed = 0;
+    cars[0].vx = 0;
+    cars[0].vy = 0;
+    cars[0].lap = 0;
+    cars[0].progress = 0;
+    cars[0].lastProgress = 0;
+    cars[0].crossedOnce = false;
+    cars[0].finished = false;
+
+    cars[1].x = track.start.x + bx - ox;
+    cars[1].y = track.start.y + by - oy;
+    cars[1].angle = a;
+    cars[1].speed = 0;
+    cars[1].vx = 0;
+    cars[1].vy = 0;
+    cars[1].lap = 0;
+    cars[1].progress = 0;
+    cars[1].lastProgress = 0;
+    cars[1].crossedOnce = false;
+    cars[1].finished = false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------------
+  const state = {
+    phase: "title", // title | countdown | racing | roundEnd | end
+    track: null,
+    cars: [
+      createCar("#e74c3c", "#922b21"),
+      createCar("#3498db", "#1a5276"),
+    ],
+    round: 1,
+    roundWins: [0, 0],
+    countdown: 3, // 3,2,1,0=GO
+    countdownTimer: 0,
+    message: "",
+    messageTimer: 0,
+    roundWinner: -1,
+    matchWinner: -1,
+  };
+
+  // ---------------------------------------------------------------------------
+  // Race flow
+  // ---------------------------------------------------------------------------
+  function startMatch() {
+    ensureAudio();
+    state.round = 1;
+    state.roundWins = [0, 0];
+    state.matchWinner = -1;
+    beginRound();
+  }
+
+  function beginRound() {
+    state.track = generateTrack();
+    placeCarsAtStart(state.track, state.cars);
+    state.phase = "countdown";
+    state.countdown = 3;
+    state.countdownTimer = 0.9;
+    state.message = "";
+    state.roundWinner = -1;
+    playCountdownBeep(false);
+    stopEngines();
+  }
+
+  function resetToTitle() {
+    state.phase = "title";
+    state.track = generateTrack();
+    placeCarsAtStart(state.track, state.cars);
+    stopEngines();
+  }
+
+  function onRoundComplete(winnerIndex) {
+    state.phase = "roundEnd";
+    state.roundWinner = winnerIndex;
+    state.roundWins[winnerIndex]++;
+    state.message = winnerIndex === 0 ? "PLAYER 1 WINS THE ROUND!" : "PLAYER 2 WINS THE ROUND!";
+    state.messageTimer = 2.4;
+    playRoundWin();
+    stopEngines();
+  }
+
+  function afterRoundEnd() {
+    if (state.round >= ROUNDS_TOTAL) {
+      state.phase = "end";
+      if (state.roundWins[0] > state.roundWins[1]) state.matchWinner = 0;
+      else if (state.roundWins[1] > state.roundWins[0]) state.matchWinner = 1;
+      else state.matchWinner = -1; // tie
+      stopEngines();
+    } else {
+      state.round++;
+      beginRound();
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Physics & collision
+  // ---------------------------------------------------------------------------
+  function updateCar(car, steer, dt) {
+    const track = state.track;
+    const racing = state.phase === "racing" && !car.finished;
+
+    // Steering
+    if (racing && steer !== 0) {
+      car.angle += steer * TURN_RATE * (0.45 + 0.55 * Math.min(1, Math.abs(car.speed) / BASE_SPEED));
+    }
+
+    // Target speed
+    const info = nearestOnTrack(track, car.x, car.y);
+    const onRoad = info.onRoad;
+    const targetSpeed = racing ? (onRoad ? BASE_SPEED : BASE_SPEED * GRASS_SPEED_MULT) : 0;
+
+    car.speed = lerp(car.speed, targetSpeed, ACCEL_SMOOTH);
+
+    // Desired velocity along heading + inertia (drift)
+    const desiredVx = Math.cos(car.angle) * car.speed;
+    const desiredVy = Math.sin(car.angle) * car.speed;
+    car.vx = lerp(car.vx, desiredVx, 1 - DRIFT + 0.08);
+    car.vy = lerp(car.vy, desiredVy, 1 - DRIFT + 0.08);
+
+    // Slightly stronger lateral damping when on grass
+    if (!onRoad) {
+      car.vx *= 0.96;
+      car.vy *= 0.96;
+    }
+
+    car.x += car.vx;
+    car.y += car.vy;
+
+    // Soft keep-in-track: if far off road, push back toward centerline
+    const info2 = nearestOnTrack(track, car.x, car.y);
+    if (info2.dist > track.halfWidth) {
+      const overshoot = info2.dist - track.halfWidth;
+      const nx = (info2.nearest.x - car.x) / (info2.dist || 1);
+      const ny = (info2.nearest.y - car.y) / (info2.dist || 1);
+      const push = Math.min(OFFROAD_PUSH * (overshoot / 20 + 0.5), overshoot);
+      car.x += nx * push;
+      car.y += ny * push;
+      // Kill outward velocity
+      const vDot = car.vx * nx + car.vy * ny;
+      if (vDot < 0) {
+        car.vx -= nx * vDot * 0.8;
+        car.vy -= ny * vDot * 0.8;
+      }
+    }
+
+    // Canvas soft bounds
+    car.x = clamp(car.x, 8, W - 8);
+    car.y = clamp(car.y, 8, H - 8);
+
+    // Lap progress / crossing start-finish
+    updateLapProgress(car, track);
+  }
+
+  function updateLapProgress(car, track) {
+    const info = nearestOnTrack(track, car.x, car.y);
+    const p = info.progress;
+    const last = car.lastProgress;
+
+    // Detect forward wrap across start (high progress -> low)
+    // Require car roughly near start and facing correct direction
+    const nearStart = info.index < 12 || info.index > track.centerline.length - 15;
+    const facingOk = Math.abs(normalizeAngle(car.angle - track.startAngle)) < Math.PI * 0.55;
+
+    if (car.crossedOnce && nearStart && facingOk && last > 0.75 && p < 0.2 && !car.finished) {
+      car.lap++;
+      playLapBeep();
+      if (car.lap >= LAPS_PER_ROUND) {
+        car.finished = true;
+        car.speed = 0;
+      }
+    }
+
+    // Leave start zone once before counting laps
+    if (!car.crossedOnce && p > 0.15 && p < 0.85) {
+      car.crossedOnce = true;
+    }
+
+    car.progress = p;
+    car.lastProgress = p;
+  }
+
+  function collideCars(c1, c2) {
+    const dx = c2.x - c1.x;
+    const dy = c2.y - c1.y;
+    const d = Math.hypot(dx, dy);
+    const minDist = (CAR_LENGTH + CAR_WIDTH) * 0.55;
+    if (d < minDist && d > 0.01) {
+      const nx = dx / d;
+      const ny = dy / d;
+      const overlap = minDist - d;
+      // Separate
+      c1.x -= nx * overlap * 0.5;
+      c1.y -= ny * overlap * 0.5;
+      c2.x += nx * overlap * 0.5;
+      c2.y += ny * overlap * 0.5;
+      // Bounce impulse
+      const relVx = c2.vx - c1.vx;
+      const relVy = c2.vy - c1.vy;
+      const relN = relVx * nx + relVy * ny;
+      if (relN < 0) {
+        const impulse = -relN * 0.85 + COLLISION_PUSH * 0.15;
+        c1.vx -= nx * impulse;
+        c1.vy -= ny * impulse;
+        c2.vx += nx * impulse;
+        c2.vy += ny * impulse;
+      } else {
+        // Still push apart slightly
+        c1.vx -= nx * COLLISION_PUSH * 0.3;
+        c1.vy -= ny * COLLISION_PUSH * 0.3;
+        c2.vx += nx * COLLISION_PUSH * 0.3;
+        c2.vy += ny * COLLISION_PUSH * 0.3;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Drawing
+  // ---------------------------------------------------------------------------
+  function drawGrassBackground() {
+    // Dirt/grass base with subtle noise stripes
+    const g = ctx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, "#2d5a27");
+    g.addColorStop(0.5, "#3a6b32");
+    g.addColorStop(1, "#2a5224");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // Speckle
+    ctx.fillStyle = "rgba(0,0,0,0.06)";
+    for (let i = 0; i < 80; i++) {
+      const x = (i * 97 + 13) % W;
+      const y = (i * 53 + 29) % H;
+      ctx.fillRect(x, y, 3, 3);
+    }
+    ctx.fillStyle = "rgba(255,255,255,0.04)";
+    for (let i = 0; i < 60; i++) {
+      const x = (i * 71 + 41) % W;
+      const y = (i * 89 + 7) % H;
+      ctx.fillRect(x, y, 2, 2);
+    }
+  }
+
+  function drawTrack(track) {
+    const L = track.leftEdge;
+    const R = track.rightEdge;
+    const n = L.length;
+
+    // Road asphalt as filled strip (left edge forward, right edge reverse)
+    ctx.beginPath();
+    ctx.moveTo(L[0].x, L[0].y);
+    for (let i = 1; i < n; i++) ctx.lineTo(L[i].x, L[i].y);
+    for (let i = n - 1; i >= 0; i--) ctx.lineTo(R[i].x, R[i].y);
+    ctx.closePath();
+
+    // Asphalt fill
+    const ag = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, 420);
+    ag.addColorStop(0, "#3a3a42");
+    ag.addColorStop(1, "#2a2a30");
+    ctx.fillStyle = ag;
+    ctx.fill();
+
+    // Road edge lines (white)
+    ctx.strokeStyle = "#f0f0f0";
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(L[0].x, L[0].y);
+    for (let i = 1; i < n; i++) ctx.lineTo(L[i].x, L[i].y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(R[0].x, R[0].y);
+    for (let i = 1; i < n; i++) ctx.lineTo(R[i].x, R[i].y);
+    ctx.stroke();
+
+    // Center dashed lane markings
+    const cl = track.centerline;
+    ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([12, 14]);
+    ctx.beginPath();
+    ctx.moveTo(cl[0].x, cl[0].y);
+    for (let i = 1; i < cl.length; i++) ctx.lineTo(cl[i].x, cl[i].y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Soft outer dark edge for depth
+    ctx.strokeStyle = "rgba(0,0,0,0.25)";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(L[0].x, L[0].y);
+    for (let i = 1; i < n; i++) ctx.lineTo(L[i].x, L[i].y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(R[0].x, R[0].y);
+    for (let i = 1; i < n; i++) ctx.lineTo(R[i].x, R[i].y);
+    ctx.stroke();
+
+    drawStartFinish(track);
+  }
+
+  function drawStartFinish(track) {
+    const a = track.startAngle;
+    const px = Math.cos(a + Math.PI / 2);
+    const py = Math.sin(a + Math.PI / 2);
+    const hw = track.halfWidth;
+    const x0 = track.start.x - px * hw;
+    const y0 = track.start.y - py * hw;
+    const x1 = track.start.x + px * hw;
+    const y1 = track.start.y + py * hw;
+
+    // Checkered band along the line
+    const checks = 8;
+    const bandW = 10;
+    const nx = Math.cos(a);
+    const ny = Math.sin(a);
+
+    for (let i = 0; i < checks; i++) {
+      const t0 = i / checks;
+      const t1 = (i + 1) / checks;
+      const sx0 = lerp(x0, x1, t0);
+      const sy0 = lerp(y0, y1, t0);
+      const sx1 = lerp(x0, x1, t1);
+      const sy1 = lerp(y0, y1, t1);
+
+      for (let row = 0; row < 2; row++) {
+        const off = (row - 0.5) * bandW;
+        const black = (i + row) % 2 === 0;
+        ctx.fillStyle = black ? "#111" : "#eee";
+        ctx.beginPath();
+        ctx.moveTo(sx0 + nx * (off - bandW / 2), sy0 + ny * (off - bandW / 2));
+        ctx.lineTo(sx1 + nx * (off - bandW / 2), sy1 + ny * (off - bandW / 2));
+        ctx.lineTo(sx1 + nx * (off + bandW / 2), sy1 + ny * (off + bandW / 2));
+        ctx.lineTo(sx0 + nx * (off + bandW / 2), sy0 + ny * (off + bandW / 2));
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+  }
+
+  function drawCar(car) {
+    ctx.save();
+    ctx.translate(car.x, car.y);
+    ctx.rotate(car.angle);
+
+    // Shadow
+    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    ctx.beginPath();
+    roundRect(-CAR_LENGTH / 2 + 1, -CAR_WIDTH / 2 + 2, CAR_LENGTH, CAR_WIDTH, 3);
+    ctx.fill();
+
+    // Body
+    const bodyGrad = ctx.createLinearGradient(-CAR_LENGTH / 2, 0, CAR_LENGTH / 2, 0);
+    bodyGrad.addColorStop(0, car.colorDark);
+    bodyGrad.addColorStop(0.4, car.color);
+    bodyGrad.addColorStop(1, car.color);
+    ctx.fillStyle = bodyGrad;
+    ctx.strokeStyle = "#111";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    roundRect(-CAR_LENGTH / 2, -CAR_WIDTH / 2, CAR_LENGTH, CAR_WIDTH, 3);
+    ctx.fill();
+    ctx.stroke();
+
+    // Cockpit
+    ctx.fillStyle = "rgba(20,20,30,0.65)";
+    ctx.fillRect(-2, -CAR_WIDTH / 2 + 2, 8, CAR_WIDTH - 4);
+
+    // Nose highlight
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.fillRect(CAR_LENGTH / 2 - 6, -2, 5, 4);
+
+    // Wheels
+    ctx.fillStyle = "#1a1a1a";
+    ctx.fillRect(-CAR_LENGTH / 2 + 2, -CAR_WIDTH / 2 - 2, 6, 3);
+    ctx.fillRect(-CAR_LENGTH / 2 + 2, CAR_WIDTH / 2 - 1, 6, 3);
+    ctx.fillRect(CAR_LENGTH / 2 - 8, -CAR_WIDTH / 2 - 2, 6, 3);
+    ctx.fillRect(CAR_LENGTH / 2 - 8, CAR_WIDTH / 2 - 1, 6, 3);
+
+    ctx.restore();
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  /** Text with dark outline for readability */
+  function drawOutlinedText(text, x, y, size, color, align) {
+    ctx.font = `bold ${size}px system-ui, sans-serif`;
+    ctx.textAlign = align || "left";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = Math.max(3, size / 6);
+    ctx.strokeStyle = "rgba(0,0,0,0.85)";
+    ctx.strokeText(text, x, y);
+    ctx.fillStyle = color || "#fff";
+    ctx.fillText(text, x, y);
+  }
+
+  function drawWinDots(x, y, wins, color, total) {
+    for (let i = 0; i < total; i++) {
+      const dx = x + i * 16;
+      ctx.beginPath();
+      ctx.arc(dx, y, 6, 0, Math.PI * 2);
+      if (i < wins) {
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = "rgba(0,0,0,0.35)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,255,255,0.4)";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
+  }
+
+  function drawUI() {
+    // Top bar background
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0, 0, W, 48);
+
+    const c0 = state.cars[0];
+    const c1 = state.cars[1];
+
+    // Current lap (1-based while racing; 3/3 when finished)
+    const lapDisp = (c) =>
+      c.finished ? LAPS_PER_ROUND : Math.min(c.lap + 1, LAPS_PER_ROUND);
+
+    // P1 laps
+    drawOutlinedText(`P1  LAP ${lapDisp(c0)}/${LAPS_PER_ROUND}`, 16, 24, 18, "#ff8a80", "left");
+    drawWinDots(16, 40, state.roundWins[0], "#e74c3c", ROUNDS_TOTAL);
+
+    // Center round
+    drawOutlinedText(`ROUND ${state.round}/${ROUNDS_TOTAL}`, W / 2, 24, 20, "#fff", "center");
+
+    // P2 laps
+    drawOutlinedText(`P2  LAP ${lapDisp(c1)}/${LAPS_PER_ROUND}`, W - 16, 24, 18, "#81d4fa", "right");
+    // Win dots right-aligned
+    drawWinDots(W - 16 - (ROUNDS_TOTAL - 1) * 16 - 6, 40, state.roundWins[1], "#3498db", ROUNDS_TOTAL);
+
+    // Controls hint bottom
+    ctx.fillStyle = "rgba(0,0,0,0.4)";
+    ctx.fillRect(0, H - 28, W, 28);
+    drawOutlinedText("P1:  ←  →     |     P2:  A  D     |     Auto-accelerate", W / 2, H - 14, 13, "#ddd", "center");
+  }
+
+  function drawOverlayScreens() {
+    if (state.phase === "title") {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(0, 0, W, H);
+      drawOutlinedText("HOTSEAT CIRCUIT", W / 2, H / 2 - 60, 42, "#fff", "center");
+      drawOutlinedText("2-Player Local Racing", W / 2, H / 2 - 20, 20, "#ccc", "center");
+      drawOutlinedText("Best of 3 rounds  ·  3 laps each", W / 2, H / 2 + 16, 16, "#aaa", "center");
+      drawOutlinedText("Press SPACE or ENTER to start", W / 2, H / 2 + 70, 18, "#ffd54f", "center");
+      drawOutlinedText("P1: Red (← →)   P2: Blue (A D)", W / 2, H / 2 + 110, 15, "#bbb", "center");
+    }
+
+    if (state.phase === "countdown") {
+      const label = state.countdown > 0 ? String(state.countdown) : "GO!";
+      const size = state.countdown > 0 ? 96 : 80;
+      const col = state.countdown > 0 ? "#fff" : "#76ff03";
+      drawOutlinedText(label, W / 2, H / 2, size, col, "center");
+    }
+
+    if (state.phase === "roundEnd") {
+      ctx.fillStyle = "rgba(0,0,0,0.4)";
+      ctx.fillRect(0, 0, W, H);
+      const col = state.roundWinner === 0 ? "#ff8a80" : "#81d4fa";
+      drawOutlinedText(state.message, W / 2, H / 2 - 10, 28, col, "center");
+      drawOutlinedText(
+        `Round wins  P1 ${state.roundWins[0]}  –  ${state.roundWins[1]} P2`,
+        W / 2,
+        H / 2 + 30,
+        18,
+        "#eee",
+        "center"
+      );
+    }
+
+    if (state.phase === "end") {
+      ctx.fillStyle = "rgba(0,0,0,0.65)";
+      ctx.fillRect(0, 0, W, H);
+      drawOutlinedText("RACE COMPLETE", W / 2, H / 2 - 70, 36, "#fff", "center");
+      if (state.matchWinner === 0) {
+        drawOutlinedText("PLAYER 1 WINS!", W / 2, H / 2 - 10, 40, "#ff8a80", "center");
+      } else if (state.matchWinner === 1) {
+        drawOutlinedText("PLAYER 2 WINS!", W / 2, H / 2 - 10, 40, "#81d4fa", "center");
+      } else {
+        drawOutlinedText("IT'S A TIE!", W / 2, H / 2 - 10, 40, "#ffd54f", "center");
+      }
+      drawOutlinedText(
+        `Final  P1 ${state.roundWins[0]}  –  ${state.roundWins[1]} P2`,
+        W / 2,
+        H / 2 + 40,
+        22,
+        "#eee",
+        "center"
+      );
+      drawOutlinedText("Press SPACE or ENTER to play again", W / 2, H / 2 + 90, 16, "#ffd54f", "center");
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------------
+  let lastTime = performance.now();
+  let collisionCooldown = 0;
+
+  function tick(now) {
+    const dt = Math.min(0.05, (now - lastTime) / 1000);
+    lastTime = now;
+
+    update(dt);
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  function update(dt) {
+    if (collisionCooldown > 0) collisionCooldown -= dt;
+
+    if (state.phase === "countdown") {
+      state.countdownTimer -= dt;
+      if (state.countdownTimer <= 0) {
+        if (state.countdown > 0) {
+          state.countdown--;
+          state.countdownTimer = state.countdown === 0 ? 0.7 : 0.9;
+          playCountdownBeep(state.countdown === 0);
+          if (state.countdown === 0) {
+            // GO — short delay then race
+          }
+        } else {
+          state.phase = "racing";
+        }
+      }
+      // Still allow engines quiet
+      updateEngineSound(0, 0, false);
+      updateEngineSound(1, 0, false);
+      return;
+    }
+
+    if (state.phase === "roundEnd") {
+      state.messageTimer -= dt;
+      if (state.messageTimer <= 0) afterRoundEnd();
+      return;
+    }
+
+    if (state.phase !== "racing") {
+      updateEngineSound(0, 0, false);
+      updateEngineSound(1, 0, false);
+      return;
+    }
+
+    // Steering input
+    let s0 = 0;
+    if (keys["ArrowLeft"]) s0 -= 1;
+    if (keys["ArrowRight"]) s0 += 1;
+    let s1 = 0;
+    if (keys["KeyA"]) s1 -= 1;
+    if (keys["KeyD"]) s1 += 1;
+
+    updateCar(state.cars[0], s0, dt);
+    updateCar(state.cars[1], s1, dt);
+
+    // Car-car collision (cooldown avoids audio spam)
+    if (collideCars(state.cars[0], state.cars[1]) && collisionCooldown <= 0) {
+      playCollision();
+      collisionCooldown = 0.18;
+    }
+
+    updateEngineSound(0, state.cars[0].speed, true);
+    updateEngineSound(1, state.cars[1].speed, true);
+
+    // Round win check — first to finish 3 laps
+    if (state.cars[0].finished && state.roundWinner < 0) {
+      onRoundComplete(0);
+    } else if (state.cars[1].finished && state.roundWinner < 0) {
+      onRoundComplete(1);
+    }
+  }
+
+  function render() {
+    drawGrassBackground();
+    if (state.track) drawTrack(state.track);
+    drawCar(state.cars[0]);
+    drawCar(state.cars[1]);
+    drawUI();
+    drawOverlayScreens();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Boot
+  // ---------------------------------------------------------------------------
+  state.track = generateTrack();
+  placeCarsAtStart(state.track, state.cars);
+  requestAnimationFrame(tick);
+})();
+  </script>
+</body>
+</html>

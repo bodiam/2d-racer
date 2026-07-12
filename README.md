@@ -19,22 +19,26 @@ Each model had to produce, in one shot, a self-contained HTML file that implemen
 
 Each directory contains one model's single-file attempt. Open the HTML file directly in a browser to play.
 
-| Model              | File                                           |
-| ------------------ | ---------------------------------------------- |
-| Claude Fable 5     | [`fable-5/index.html`](./fable-5/index.html)               |
-| Claude Opus 4.6    | [`opus-4.6/index.html`](./opus-4.6/index.html)             |
-| Claude Opus 4.5    | [`opus-4.5/index.html`](./opus-4.5/index.html)             |
-| Gemini 3.1 Pro     | [`gemini-3.1-pro/index.html`](./gemini-3.1-pro/index.html) |
-| Gemini 3 Fast      | [`gemini-3-fast/index.html`](./gemini-3-fast/index.html)   |
-| Gemma 4 31B IT     | [`gemma-4-31b-it/index.html`](./gemma-4-31b-it/index.html) |
-| Grok 4.2 Expert    | [`grok-4.2-expert/index.html`](./grok-4.2-expert/index.html) |
-| GLM 5.1            | [`glm-5.1/index.html`](./glm-5.1/index.html)               |
-| Kimi K2 Thinking   | [`kimi-k2-thinking/index.html`](./kimi-k2-thinking/index.html) |
-| MiniMax 2.5        | [`minimax-2.5/racing.html`](./minimax-2.5/racing.html)     |
+| Model            | File                                                               |
+| ---------------- | ------------------------------------------------------------------ |
+| Claude Fable 5   | [`fable-5/index.html`](./fable-5/index.html)                       |
+| Claude Opus 4.6  | [`opus-4.6/index.html`](./opus-4.6/index.html)                     |
+| Claude Opus 4.5  | [`opus-4.5/index.html`](./opus-4.5/index.html)                     |
+| Gemini 3.1 Pro   | [`gemini-3.1-pro/index.html`](./gemini-3.1-pro/index.html)         |
+| Gemini 3 Fast    | [`gemini-3-fast/index.html`](./gemini-3-fast/index.html)           |
+| Gemma 4 31B IT   | [`gemma-4-31b-it/index.html`](./gemma-4-31b-it/index.html)         |
+| GLM 5.1          | [`glm-5.1/index.html`](./glm-5.1/index.html)                       |
+| GPT-5.5          | [`gpt-5.5/index.html`](./gpt-5.5/index.html)                       |
+| Grok 4.5         | [`grok-4.5/index.html`](./grok-4.5/index.html)                     |
+| Grok 4.2 Expert  | [`grok-4.2-expert/index.html`](./grok-4.2-expert/index.html)       |
+| Kimi K2 Thinking | [`kimi-k2-thinking/index.html`](./kimi-k2-thinking/index.html)     |
+| MiniMax 2.5      | [`minimax-2.5/racing.html`](./minimax-2.5/racing.html)             |
 
 MiniMax 2.5 also produced a [`SPEC.md`](./minimax-2.5/SPEC.md) alongside its implementation.
 
-Outside the benchmark, Claude Fable 5 also made a bonus top-down 3D remake in [`fable-5-3d/index.html`](./fable-5-3d/index.html), with upgraded track generation (chicanes, elevation, curbs, self-intersection checks). It uses Three.js from a CDN, so it needs network access on first load.
+Grok 4.5 also produced an earlier [`working but incomplete version`](./grok-4.5/index-not-completed-but-working.html).
+
+Outside the benchmark, Claude Fable 5 and GPT-5.5 also made bonus 3D remakes in [`fable-5-3d/index.html`](./fable-5-3d/index.html) and [`gpt-5.5-3d/index.html`](./gpt-5.5-3d/index.html). They use Three.js from a CDN, so they need network access on first load.
 
 ## Running
 
